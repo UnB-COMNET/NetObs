@@ -861,7 +861,20 @@ def _parse_ip_link(output: str) -> Dict[str, Dict[str, float]]:
 # Between throttled cycles, `_samples_latest` simply keeps serving the last
 # known value, so nothing goes blank on the dashboard — only its update rate
 # drops, trading a bit of freshness for materially less CPU per cycle.
-FAST_PROBE_INTERVAL_CYCLES = max(1, int(os.getenv("FAST_PROBE_INTERVAL_CYCLES", "3")))
+# v2: a camada rapida (estado de enlace, TCP/SNMP) passa a ser lida a cada ciclo (antes: a cada 3).
+FAST_PROBE_INTERVAL_CYCLES = max(1, int(os.getenv("FAST_PROBE_INTERVAL_CYCLES", "1")))
+# v2: contadores de porta e fluxos do OVS entram em TODO ciclo (antes: camada lenta, 1 em cada 10 ciclos).
+# Com OVS_EVERY_CYCLE=0 o comportamento da v1 e restaurado (usado na ablacao).
+OVS_EVERY_CYCLE = os.getenv("OVS_EVERY_CYCLE", "1") == "1"
+# v2: o ciclo de coleta mantem a taxa nominal (agenda por prazo), em vez de dormir o intervalo APOS coletar.
+FIXED_RATE_LOOP = os.getenv("FIXED_RATE_LOOP", "1") == "1"
+# v2: saude do controlador por HTTP direto do coletor (sem `curl` dentro do container e sem o
+# fallback "container vivo = controlador ok"). CONTROLLER_PROBE_MODE=exec restaura a v1.
+CONTROLLER_PROBE_MODE = os.getenv("CONTROLLER_PROBE_MODE", "http")
+# v2: a sonda ICMP mira o PAR (data_ip/mgmt_ip do outro host), nao o proprio IP do no.
+PING_PEER = os.getenv("PING_PEER", "1") == "1"
+# v2: nao semear o cache de ultimas metricas com amostras sinteticas quando a coleta e real.
+SEED_SYNTHETIC = os.getenv("SEED_SYNTHETIC", "0") == "1"
 SLOW_PROBE_INTERVAL_CYCLES = max(1, int(os.getenv("SLOW_PROBE_INTERVAL_CYCLES", "10")))
 # BUG FIX (found via a rate-dependent CPU spike pattern in E1): this used to
 # be a cycle-count throttle (`_collect_cycle_count % N`), but each auto-collect
@@ -877,7 +890,7 @@ STATS_PROBE_INTERVAL_SEC = float(os.getenv("STATS_PROBE_INTERVAL_SEC", "1050"))
 _last_stats_probe_ts = time.time()
 
 
-def _build_probe_script(node: Any, include_fast: bool, include_slow: bool) -> tuple[str, List[str]]:
+def _build_probe_script(node: Any, include_fast: bool, include_slow: bool, ping_target: str | None = None) -> tuple[str, List[str]]:
     """Build one shell script covering transport/link (+ ping for hosts) so a
     node needs at most one `docker exec` for all of them instead of up to 5."""
     cmds: List[str] = []
@@ -897,7 +910,7 @@ def _build_probe_script(node: Any, include_fast: bool, include_slow: bool) -> tu
     if include_slow and layer_flags.get("network", True) and node.type == "host" and node.mgmt_ip:
         # 2 probes @ 20ms spacing still yields min/avg/max/mdev but with a
         # ~20-40ms floor instead of the previous ~600ms (-c3/-i0.2).
-        cmds.append(f"ping -c 2 -i 0.02 -W 1 {shlex.quote(node.mgmt_ip)}")
+        cmds.append(f"ping -c 2 -i 0.02 -W 1 {shlex.quote(ping_target or node.mgmt_ip)}")
         sections.append("ping")
     if not cmds:
         return "", []
@@ -907,9 +920,9 @@ def _build_probe_script(node: Any, include_fast: bool, include_slow: bool) -> tu
 
 def _build_extra_script(node: Any, include_slow: bool) -> tuple[str, str]:
     """Controller reachability probe / OVS bridge+ports+flows in a single exec."""
-    if not include_slow:
-        return "", ""
     if node.type == "controller":
+        if not include_slow or CONTROLLER_PROBE_MODE == "http":
+            return "", ""
         script = (
             "for p in 8080 8181 6633; do "
             "out=$(curl -s -o /dev/null -w '%{http_code} %{time_total}' --max-time 2 "
@@ -919,7 +932,7 @@ def _build_extra_script(node: Any, include_slow: bool) -> tuple[str, str]:
             "done; printf '000 0'"
         )
         return script, "controller"
-    if node.type == "switch" and (layer_flags.get("control", True) or layer_flags.get("dataplane", True)):
+    if node.type == "switch" and (include_slow or OVS_EVERY_CYCLE) and (layer_flags.get("control", True) or layer_flags.get("dataplane", True)):
         parts = [
             "br=$(ovs-vsctl list-br 2>/dev/null | head -1)",
             "echo \"BRIDGE:$br\"",
@@ -937,6 +950,24 @@ async def _empty_str() -> str:
 
 
 _collect_cycle_count = 0
+
+
+def _http_probe_controller(host: str, ports: tuple = (8080, 8181), timeout: float = 1.5) -> tuple[bool, float | None]:
+    """Sonda HTTP do controlador a partir do coletor. Ok = resposta 200/401/404 (como na v1)."""
+    import urllib.error
+    import urllib.request
+    for port in ports:
+        t0 = time.perf_counter()
+        try:
+            with urllib.request.urlopen(f"http://{host}:{port}/", timeout=timeout) as r:
+                code = r.status
+        except urllib.error.HTTPError as e:
+            code = e.code
+        except Exception:
+            continue
+        if code in (200, 401, 404):
+            return True, round((time.perf_counter() - t0) * 1000, 2)
+    return False, None
 
 
 async def _collect_real(topology: Topology | None, labels: Dict[str, Any] | None = None) -> List[MetricSample]:
@@ -1001,7 +1032,12 @@ async def _collect_real(topology: Topology | None, labels: Dict[str, Any] | None
                 node_samples.append(_mk("docker_mem_util_pct", "control", node.id, round(mem_pct, 3), {"container": container}))
 
             # ── Run at most 2 `docker exec` calls for this node, concurrently ─
-            probe_script, sections = _build_probe_script(node, include_fast, include_slow)
+            _ping_target = None
+            if PING_PEER and node.type == "host":
+                _peers = [n for n in topology.nodes if n.type == "host" and n.id != node.id and (n.meta.get("data_ip") or n.mgmt_ip)]
+                if _peers:
+                    _ping_target = _peers[0].meta.get("data_ip") or _peers[0].mgmt_ip
+            probe_script, sections = _build_probe_script(node, include_fast, include_slow, _ping_target)
             extra_script, extra_kind = _build_extra_script(node, include_slow)
             probe_out, extra_out = await asyncio.gather(
                 _run_docker_script(container, probe_script) if probe_script else _empty_str(),
@@ -1009,6 +1045,11 @@ async def _collect_real(topology: Topology | None, labels: Dict[str, Any] | None
             )
 
             # ── Controller-specific metrics ──────────────────────────────────
+            if node.type == "controller" and CONTROLLER_PROBE_MODE == "http" and node.mgmt_ip and (include_slow or OVS_EVERY_CYCLE):
+                _ok, _ms = await _run_in_collection_executor(_http_probe_controller, node.mgmt_ip)
+                node_samples.append(_mk("controller_conn_ok", "control", node.id, 1.0 if _ok else 0.0, {"source": "http"}))
+                if _ms is not None:
+                    node_samples.append(_mk("controller_latency_ms", "control", node.id, _ms, {"source": "http"}))
             if extra_kind == "controller":
                 code, _, elapsed_s = extra_out.strip().partition(" ")
                 ctrl_ok = code in {"200", "401", "404"}
@@ -1728,17 +1769,18 @@ if not metric_samples:
         # Fill gaps: restored raw tends to be transport-heavy, which leaves many
         # definitions without any sample. Do one synthetic pass to maximize coverage.
         topology = next(iter(topologies.values()), None)
-        seeded = _collect_synthetic_full(topology, {"version": software_version})
+        seeded = _collect_synthetic_full(topology, {"version": software_version}) if (SEED_SYNTHETIC or not real_collection_default) else []
         if seeded:
             _store_samples(seeded)
     else:
-        seeded = _collect_synthetic_full(next(iter(topologies.values()), None), {"version": software_version})
+        seeded = _collect_synthetic_full(next(iter(topologies.values()), None), {"version": software_version}) if (SEED_SYNTHETIC or not real_collection_default) else []
         if seeded:
             _store_samples(seeded)
 
 
 async def _auto_collect_loop() -> None:
     """Continuously collect metrics to keep SSE populated."""
+    _next_deadline = time.monotonic()
     while True:
         try:
             topology = next(iter(topologies.values()), None)
@@ -1755,7 +1797,15 @@ async def _auto_collect_loop() -> None:
         except Exception:
             # Avoid crashing the loop; log could be added here later.
             pass
-        await asyncio.sleep(collection_interval_seconds)
+        if FIXED_RATE_LOOP:
+            _next_deadline += collection_interval_seconds
+            _delay = _next_deadline - time.monotonic()
+            if _delay < 0:                      # ciclo estourou o periodo: sem acumular atraso
+                _next_deadline = time.monotonic()
+                _delay = 0.0
+            await asyncio.sleep(_delay)
+        else:
+            await asyncio.sleep(collection_interval_seconds)
 
 
 @app.on_event("startup")
