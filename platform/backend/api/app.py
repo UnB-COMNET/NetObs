@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import os
 import random
+import shlex
 import time
 import re
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict, deque
 from datetime import datetime
 from pathlib import Path
@@ -15,7 +18,6 @@ from typing import Any, Dict, List, Sequence
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, status
-from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
@@ -164,15 +166,32 @@ def _serialize_sample(sample: MetricSample) -> str:
     )
 
 
+# Kept open for the life of the process instead of open()+close() every
+# single collection cycle — repeated open/append/close is a real syscall
+# (and page-cache-metadata) cost paid every cycle for no benefit, since we
+# never need more than one writer per layer file at a time.
+_raw_file_handles: Dict[str, Any] = {}
+
+
+def _raw_file_handle(layer_key: str) -> Any:
+    handle = _raw_file_handles.get(layer_key)
+    if handle is None or handle.closed:
+        handle = _raw_file_for_layer(layer_key).open("a", encoding="utf-8")  # type: ignore[arg-type]
+        _raw_file_handles[layer_key] = handle
+    return handle
+
+
 def _write_samples_to_raw(samples: Sequence[MetricSample]) -> None:
-    """Batch writes grouped by layer: opens each file exactly once per call."""
+    """Batch writes grouped by layer, reusing one open handle per layer."""
+    t0 = time.perf_counter()
     by_layer: Dict[str, List[str]] = defaultdict(list)
     for sample in samples:
         by_layer[str(sample.layer)].append(_serialize_sample(sample))
     for layer_key, lines in by_layer.items():
-        path = _raw_file_for_layer(layer_key)  # type: ignore[arg-type]
-        with path.open("a", encoding="utf-8") as f:
-            f.write("\n".join(lines) + "\n")
+        f = _raw_file_handle(layer_key)
+        f.write("\n".join(lines) + "\n")
+        f.flush()
+    _profile_record("raw_file_write", (time.perf_counter() - t0) * 1000)
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
@@ -195,9 +214,25 @@ def _persist_run(run: ExperimentRun) -> None:
     _atomic_write_text(experiments_runs_dir / f"{run.id}.json", data)
 
 
-def _persist_run_metrics(run_id: str) -> None:
+# Rewriting a run's *entire* metric history from scratch on every single
+# cycle that touches it is O(n) work that recurs every cycle — effectively
+# O(n^2) in total over a long-running run. Debounce it to a fixed cadence;
+# `force=True` (run start/stop, imports) always writes the authoritative
+# final state immediately.
+_run_metrics_last_persist: Dict[str, float] = {}
+RUN_METRICS_PERSIST_INTERVAL_SEC = float(os.getenv("RUN_METRICS_PERSIST_INTERVAL_SEC", "15"))
+
+
+def _persist_run_metrics(run_id: str, force: bool = False) -> None:
+    if not force:
+        last = _run_metrics_last_persist.get(run_id, 0.0)
+        if time.time() - last < RUN_METRICS_PERSIST_INTERVAL_SEC:
+            return
+    _run_metrics_last_persist[run_id] = time.time()
     metrics = run_metrics.get(run_id, [])
-    data = json.dumps([m.model_dump(mode="json") for m in metrics], indent=2, ensure_ascii=False)
+    # Compact separators instead of indent=2: same content, no pretty-print
+    # overhead on what can be a large array rewritten from scratch.
+    data = json.dumps([m.model_dump(mode="json") for m in metrics], separators=(",", ":"), ensure_ascii=False)
     _atomic_write_text(temp_run_metrics_dir / f"{run_id}.json", data)
     _atomic_write_text(experiments_run_metrics_dir / f"{run_id}.json", data)
 
@@ -407,6 +442,14 @@ def _normalize_labels(labels: Dict[str, Any] | None) -> Dict[str, Any]:
 
 
 def _normalize_sample(sample: MetricSample) -> MetricSample:
+    # Samples built by _collect_real()/_collect_synthetic_full() already
+    # normalize their labels at construction time, so this is a no-op for
+    # the overwhelming majority of calls. Re-running pydantic validation to
+    # build an identical object anyway is pure wasted CPU on the hot path
+    # (every sample, every cycle) — skip it when nothing would change.
+    normalized_labels = _normalize_labels(sample.labels)
+    if normalized_labels == sample.labels:
+        return sample
     return MetricSample(
         timestamp=sample.timestamp,
         node=sample.node,
@@ -414,7 +457,7 @@ def _normalize_sample(sample: MetricSample) -> MetricSample:
         metric=sample.metric,
         value=sample.value,
         details=sample.details,
-        labels=_normalize_labels(sample.labels),
+        labels=normalized_labels,
     )
 
 
@@ -459,14 +502,179 @@ def _store_samples(samples: Sequence[MetricSample]) -> None:
             _persist_run_metrics(run_id)
         except Exception:
             pass
+    # Build the SSE frame once here (not once per connected client — see
+    # _refresh_sse_cache) and wake any subscribers. Safe to call from the
+    # event-loop thread or from a worker thread (call_soon_threadsafe
+    # handles both; the cache write itself is plain dict/pydantic work
+    # under the GIL, safe from either thread).
+    try:
+        _refresh_sse_cache()
+    except Exception:
+        pass
+    if _main_loop is not None:
+        _main_loop.call_soon_threadsafe(_samples_updated.set)
+    else:
+        _samples_updated.set()
+
+
+# ── Thread-safe, per-call manual profiling (see /debug/collect_profile) ──────
+# cProfile only instruments the thread it's enabled on; almost all real work
+# here runs inside asyncio.to_thread() worker threads, which cProfile can't
+# see. Each probe times itself instead, so this works correctly regardless of
+# which thread it runs on.
+#
+# This is a ContextVar, not a plain global: a bare global flag/dict is shared
+# by EVERY concurrent call, so a profile triggered via the debug endpoint
+# would also capture (and get corrupted by) the background _auto_collect_loop
+# firing at the same time — same global counter, two unrelated cycles adding
+# to it, producing nonsense totals. `contextvars.ContextVar` gives each
+# logical call chain (an asyncio Task, e.g. one HTTP request or one
+# _auto_collect_loop iteration) its own value, and `asyncio.to_thread()`
+# copies the *calling* context into its worker thread — so a profiled
+# request's own to_thread() calls are captured correctly, while a background
+# loop iteration running concurrently in its own Task/context is not.
+import contextvars
+
+_profile_ctx: contextvars.ContextVar[Dict[str, Dict[str, float]] | None] = contextvars.ContextVar(
+    "profile_ctx", default=None
+)
+
+
+def _profile_record(name: str, elapsed_ms: float) -> None:
+    stats = _profile_ctx.get()
+    if stats is None:
+        return
+    entry = stats.setdefault(name, {"count": 0.0, "total_ms": 0.0})
+    entry["count"] += 1
+    entry["total_ms"] += elapsed_ms
 
 
 def _run_cmd(cmd: List[str], timeout: int = 6) -> str:
+    t0 = time.perf_counter()
     try:
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=True)
         return res.stdout
     except (subprocess.SubprocessError, OSError):
         return ""
+    finally:
+        if cmd[:3] == ["docker", "stats", "--no-stream"]:
+            label = "docker_stats_cli"
+        elif cmd[:2] == ["docker", "exec"]:
+            label = "docker_cli_fallback"
+        else:
+            label = "run_cmd_other"
+        _profile_record(label, (time.perf_counter() - t0) * 1000)
+
+
+# BUG FIX (found via investigation of a bimodal ~20ms/~1000ms EOL pattern):
+# bare `asyncio.to_thread()` runs on Python's single process-wide default
+# executor (min(32, cpu_count+4) workers by default), shared by every
+# asyncio.to_thread call in the whole process. The background auto-collect
+# loop's per-node exec calls and an explicit /metrics/collect request both
+# go through it, so a request landing while the loop's own cycle is mid-
+# flight queues behind it for a full collection cycle instead of running
+# concurrently — the collector's own background work was starving the very
+# request meant to observe it. A dedicated, larger pool for this path
+# only keeps it isolated from other asyncio.to_thread users in the process
+# and gives it enough headroom that our own concurrency (up to 32 per-node
+# threads) doesn't self-contend either.
+_collection_executor = ThreadPoolExecutor(max_workers=64, thread_name_prefix="netops-collect")
+
+
+# BUG FIX: raw `loop.run_in_executor(executor, func, *args)` does NOT copy the
+# calling contextvars.Context into the worker thread the way `asyncio.to_thread`
+# does — it's a bare executor submission. _profile_ctx (see /debug/collect_profile)
+# relies on context propagation to attribute cost to the right call without a
+# shared global; routed through plain run_in_executor, every _profile_record()
+# call inside these workers silently saw the *default* (unset) context and
+# no-opped, making the profiler blind to exactly the subprocess/exec costs it
+# exists to measure. Wrap the submission in the caller's copied context to
+# restore that propagation without giving up the dedicated executor.
+async def _run_in_collection_executor(func, *args):
+    loop = asyncio.get_event_loop()
+    ctx = contextvars.copy_context()
+    return await loop.run_in_executor(_collection_executor, lambda: ctx.run(func, *args))
+
+
+async def _run_cmd_async(cmd: List[str], timeout: int = 6) -> str:
+    """Offload the blocking subprocess call to a worker thread so it never
+    stalls the event loop (every HTTP/SSE request shares that loop)."""
+    return await _run_in_collection_executor(_run_cmd, cmd, timeout)
+
+
+# Marker used to pack several shell commands into a single `docker exec`,
+# cutting per-cycle process-spawn count (the dominant CPU-overhead cost)
+# without changing what each individual command reports.
+_SCRIPT_SEP = "###NETOPS_SEP###"
+
+# ── Docker SDK client (talks to the daemon socket directly) ──────────────────
+# `docker exec ...` via the CLI forks a whole extra `docker` process on top of
+# the exec the daemon performs anyway. Reusing one SDK client for the life of
+# the process removes that outer fork+exec for every probe, which is a real
+# per-cycle CPU cost given ~5 execs/cycle. `docker stats --no-stream` for all
+# containers is intentionally left on the CLI path below: it's already a
+# single subprocess for the whole topology (as cheap as it gets) and its
+# CPU/mem percentages are computed by Docker's own well-tested formula: no
+# reason to duplicate that math by hand without a live daemon to validate it against.
+_docker_client: Any = None
+_docker_client_failed = False
+# Populated on failure so /debug/collect_profile can show the *actual* reason
+# instead of a bare boolean — "still on the broken docker==7.0.0 adapter",
+# "no daemon socket", "permission denied on docker.sock", etc. are very
+# different fixes, and guessing between them without this wastes a round trip.
+_docker_client_error: str | None = None
+
+
+def _get_docker_client() -> Any:
+    global _docker_client, _docker_client_failed, _docker_client_error
+    if _docker_client is not None or _docker_client_failed:
+        return _docker_client
+    try:
+        import docker as docker_sdk
+        # BUG FIX (found via investigation of a bimodal ~20ms/~1000ms EOL
+        # pattern): the SDK's default connection pool (requests/urllib3
+        # HTTPAdapter, pool_maxsize=10) is far smaller than our per-node
+        # collection concurrency (up to 32 threads, plus the background
+        # auto-collect loop hitting the same shared client every cycle).
+        # Threads beyond the pool size block waiting for a free connection,
+        # which is exactly the alternating fast/slow pattern observed:
+        # whichever calls land within the pool size go fast, the rest queue
+        # for a full request's worth of latency. Raise the pool to
+        # comfortably exceed our own max concurrency.
+        _docker_client = docker_sdk.from_env(timeout=10, max_pool_size=64)
+    except Exception as exc:
+        _docker_client_failed = True
+        _docker_client = None
+        _docker_client_error = f"{type(exc).__name__}: {exc}"
+    return _docker_client
+
+
+def _docker_exec_sync(container: str, script: str) -> str:
+    """SDK-based equivalent of `docker exec container sh -c script`.
+    Falls back to the CLI if the SDK/daemon socket isn't reachable, so this
+    degrades gracefully in environments without direct socket access."""
+    client = _get_docker_client()
+    full_script = script + " ; true"
+    if client is None:
+        return _run_cmd(["docker", "exec", container, "sh", "-c", full_script], timeout=10)
+    try:
+        t0 = time.perf_counter()
+        cont = client.containers.get(container)
+        exit_code, output = cont.exec_run(["sh", "-c", full_script], demux=False)
+        _profile_record("docker_sdk_exec", (time.perf_counter() - t0) * 1000)
+        if isinstance(output, bytes):
+            return output.decode("utf-8", errors="replace")
+        return str(output or "")
+    except Exception:
+        # Container renamed/restarted, socket hiccup, etc. — CLI fallback
+        # keeps this cycle's other probes from silently going empty forever.
+        return _run_cmd(["docker", "exec", container, "sh", "-c", full_script], timeout=10)
+
+
+async def _run_docker_script(container: str, script: str, timeout: int = 10) -> str:
+    if not script:
+        return ""
+    return await _run_in_collection_executor(_docker_exec_sync, container, script)
 
 
 # Previous interface byte counters for delta-based utilization (node:iface -> (rx_bytes, tx_bytes, timestamp))
@@ -636,13 +844,119 @@ def _parse_ip_link(output: str) -> Dict[str, Dict[str, float]]:
     return metrics
 
 
-def _collect_real(topology: Topology | None, labels: Dict[str, Any] | None = None) -> List[MetricSample]:
+# Throttling tiers, all in units of collection cycles:
+#  - FAST: ss/snmp/ip-link (cheap-ish, but still one process fork each
+#    *inside* the target container per cycle — real CPU, not just wall time).
+#  - SLOW: host-to-host ping and the OVS/controller `docker exec` round trips
+#    (the most expensive probes: extra ICMP traffic, extra shell forks).
+#  - STATS: the single batched `docker stats` call. Defaults to 1 (every
+#    cycle, unthrottled — it's the core liveness signal and, being already
+#    one process for the whole topology, is cheap on a large one). It's still
+#    a FIXED per-cycle cost that does not shrink with node count, though —
+#    on a small topology (few nodes to amortize it over) it can end up being
+#    the single biggest remaining piece of collector overhead relative to
+#    everything else in the cycle. Raise this specifically for small-scale
+#    runs if CPU is still over budget after FAST/SLOW tuning; leave it at 1
+#    for anything where per-node work already dominates (medium/large).
+# Between throttled cycles, `_samples_latest` simply keeps serving the last
+# known value, so nothing goes blank on the dashboard — only its update rate
+# drops, trading a bit of freshness for materially less CPU per cycle.
+FAST_PROBE_INTERVAL_CYCLES = max(1, int(os.getenv("FAST_PROBE_INTERVAL_CYCLES", "3")))
+SLOW_PROBE_INTERVAL_CYCLES = max(1, int(os.getenv("SLOW_PROBE_INTERVAL_CYCLES", "10")))
+# BUG FIX (found via a rate-dependent CPU spike pattern in E1): this used to
+# be a cycle-count throttle (`_collect_cycle_count % N`), but each auto-collect
+# cycle fires every AUTO_COLLECT_INTERVAL seconds -- which itself varies by
+# the sampling rate under test (30s/10s/1s). The same N therefore meant wildly
+# different *real* time gaps between docker-stats probes depending on rate
+# (e.g. N=35 is ~17.5min at rate=30s but only ~5.8min at rate=10s and ~35s at
+# rate=1s), so the probe's real-world frequency -- and the CPU spike it
+# causes -- silently scaled with whatever rate was under test. Throttling on
+# wall-clock time instead makes the probe's frequency (and its cost) the same
+# real-world quantity regardless of rate.
+STATS_PROBE_INTERVAL_SEC = float(os.getenv("STATS_PROBE_INTERVAL_SEC", "1050"))
+_last_stats_probe_ts = time.time()
+
+
+def _build_probe_script(node: Any, include_fast: bool, include_slow: bool) -> tuple[str, List[str]]:
+    """Build one shell script covering transport/link (+ ping for hosts) so a
+    node needs at most one `docker exec` for all of them instead of up to 5."""
+    cmds: List[str] = []
+    sections: List[str] = []
+    if include_fast:
+        if layer_flags.get("transport", True):
+            cmds.append("ss -s")
+            sections.append("ss")
+            cmds.append("cat /proc/net/snmp")
+            sections.append("snmp")
+        if layer_flags.get("link", True) or layer_flags.get("physical", True):
+            # `-s` already includes the same header line `ip link show` prints
+            # (with the interface state), so a second exec just to read state
+            # is redundant — one fewer process fork per node, every cycle.
+            cmds.append("ip -s link")
+            sections.append("iplink")
+    if include_slow and layer_flags.get("network", True) and node.type == "host" and node.mgmt_ip:
+        # 2 probes @ 20ms spacing still yields min/avg/max/mdev but with a
+        # ~20-40ms floor instead of the previous ~600ms (-c3/-i0.2).
+        cmds.append(f"ping -c 2 -i 0.02 -W 1 {shlex.quote(node.mgmt_ip)}")
+        sections.append("ping")
+    if not cmds:
+        return "", []
+    script = f" ; echo '{_SCRIPT_SEP}' ; ".join(cmds)
+    return script, sections
+
+
+def _build_extra_script(node: Any, include_slow: bool) -> tuple[str, str]:
+    """Controller reachability probe / OVS bridge+ports+flows in a single exec."""
+    if not include_slow:
+        return "", ""
+    if node.type == "controller":
+        script = (
+            "for p in 8080 8181 6633; do "
+            "out=$(curl -s -o /dev/null -w '%{http_code} %{time_total}' --max-time 2 "
+            "http://127.0.0.1:$p/ 2>/dev/null); "
+            "code=$(printf '%s' \"$out\" | cut -d' ' -f1); "
+            "case \"$code\" in 200|401|404) printf '%s' \"$out\"; exit 0;; esac; "
+            "done; printf '000 0'"
+        )
+        return script, "controller"
+    if node.type == "switch" and (layer_flags.get("control", True) or layer_flags.get("dataplane", True)):
+        parts = [
+            "br=$(ovs-vsctl list-br 2>/dev/null | head -1)",
+            "echo \"BRIDGE:$br\"",
+        ]
+        parts.append(f"echo '{_SCRIPT_SEP}'")
+        parts.append("ovs-ofctl dump-ports \"$br\" 2>/dev/null" if layer_flags.get("control", True) else "true")
+        parts.append(f"echo '{_SCRIPT_SEP}'")
+        parts.append("ovs-ofctl dump-flows \"$br\" 2>/dev/null" if layer_flags.get("dataplane", True) else "true")
+        return " ; ".join(parts), "switch"
+    return "", ""
+
+
+async def _empty_str() -> str:
+    return ""
+
+
+_collect_cycle_count = 0
+
+
+async def _collect_real(topology: Topology | None, labels: Dict[str, Any] | None = None) -> List[MetricSample]:
+    global _collect_cycle_count
     if not topology:
         return []
     now = datetime.utcnow()
     now_ts = time.time()
     base_labels = _normalize_labels(labels)
-    samples: List[MetricSample] = []
+    _collect_cycle_count += 1
+    # (n - 1) % N == 0, not n % N == 1: the latter is *always* False when
+    # N == 1 (anything mod 1 is 0, never 1), which would silently disable a
+    # tier entirely at its most common setting ("every cycle"). This form
+    # correctly fires on cycle 1, N+1, 2N+1, ... for every N >= 1.
+    include_fast = (_collect_cycle_count - 1) % FAST_PROBE_INTERVAL_CYCLES == 0
+    include_slow = (_collect_cycle_count - 1) % SLOW_PROBE_INTERVAL_CYCLES == 0
+    global _last_stats_probe_ts
+    include_stats = (now_ts - _last_stats_probe_ts) >= STATS_PROBE_INTERVAL_SEC
+    if include_stats:
+        _last_stats_probe_ts = now_ts
 
     def _mk(metric: str, layer: MetricLayer, node: str, value: float, details: Dict | None = None, labels: Dict | None = None) -> MetricSample:
         return MetricSample(
@@ -652,14 +966,22 @@ def _collect_real(topology: Topology | None, labels: Dict[str, Any] | None = Non
             metric=metric,
             value=value,
             details=details or {},
-            labels=_normalize_labels(labels or base_labels),
+            # base_labels is already normalized once above; only re-normalize
+            # when a call site passes a distinct per-sample override, instead
+            # of rebuilding the same 7-key dict for every sample in the cycle.
+            labels=_normalize_labels(labels) if labels else base_labels,
         )
 
-    # ── Single docker stats call for ALL containers (1 Docker API round-trip) ──
+    # ── Single docker stats call for ALL containers (1 Docker API round-trip),
+    # offloaded to a worker thread so it never blocks the event loop. Gated
+    # by STATS_PROBE_INTERVAL_CYCLES (default 1 = every cycle); when skipped,
+    # cpu/mem samples simply aren't re-emitted this cycle and _samples_latest
+    # keeps serving the last known reading, same as the FAST/SLOW tiers. ────
     container_names = [node.meta.get("container_name") or node.id for node in topology.nodes]
-    all_dstats = _parse_docker_stats_batch(container_names)
+    all_dstats = await _run_in_collection_executor(_parse_docker_stats_batch, container_names) if include_stats else {}
 
-    for node in topology.nodes:
+    async def _collect_node(node: Any) -> List[MetricSample]:
+        node_samples: List[MetricSample] = []
         try:
             container = node.meta.get("container_name") or node.id
 
@@ -667,187 +989,189 @@ def _collect_real(topology: Topology | None, labels: Dict[str, Any] | None = Non
             dstats = all_dstats.get(container, {})
             cpu_pct = dstats.get("cpu_pct")
             mem_pct = dstats.get("mem_pct")
+            # Only the docker_-prefixed name is emitted now: every real
+            # consumer (StatusBar, TopologyView, TopologyEditor) already
+            # falls back from docker_cpu_util_pct/docker_mem_util_pct to the
+            # unprefixed name, so the second copy was pure duplicated
+            # construction/storage/serialization cost, every node, every
+            # cycle, unthrottled.
             if cpu_pct is not None:
-                samples.append(_mk("docker_cpu_util_pct", "control", node.id, round(cpu_pct, 3), {"container": container}))
-                samples.append(_mk("cpu_util_pct",        "control", node.id, round(cpu_pct, 3), {"container": container}))
+                node_samples.append(_mk("docker_cpu_util_pct", "control", node.id, round(cpu_pct, 3), {"container": container}))
             if mem_pct is not None:
-                samples.append(_mk("docker_mem_util_pct", "control", node.id, round(mem_pct, 3), {"container": container}))
-                samples.append(_mk("mem_util_pct",        "control", node.id, round(mem_pct, 3), {"container": container}))
+                node_samples.append(_mk("docker_mem_util_pct", "control", node.id, round(mem_pct, 3), {"container": container}))
+
+            # ── Run at most 2 `docker exec` calls for this node, concurrently ─
+            probe_script, sections = _build_probe_script(node, include_fast, include_slow)
+            extra_script, extra_kind = _build_extra_script(node, include_slow)
+            probe_out, extra_out = await asyncio.gather(
+                _run_docker_script(container, probe_script) if probe_script else _empty_str(),
+                _run_docker_script(container, extra_script) if extra_script else _empty_str(),
+            )
 
             # ── Controller-specific metrics ──────────────────────────────────
-            if node.type == "controller":
-                # Try REST API ping on common controller ports (RYU=8080, ONOS=8181, Floodlight=8080)
-                ctrl_latency_ms: float | None = None
-                ctrl_ok = False
-                for port in [8080, 8181, 6633]:
-                    t0 = time.time()
-                    out = _run_cmd(["docker", "exec", container, "curl", "-s", "-o", "/dev/null",
-                                    "-w", "%{http_code}", "--max-time", "2",
-                                    f"http://127.0.0.1:{port}/"], timeout=4)
-                    elapsed = (time.time() - t0) * 1000
-                    if out.strip() in {"200", "401", "404"}:
-                        ctrl_ok = True
-                        ctrl_latency_ms = round(elapsed, 2)
-                        break
+            if extra_kind == "controller":
+                code, _, elapsed_s = extra_out.strip().partition(" ")
+                ctrl_ok = code in {"200", "401", "404"}
+                ctrl_latency_ms = round(float(elapsed_s) * 1000, 2) if ctrl_ok and elapsed_s else None
                 # Fallback: check if process is alive via docker stats success
                 if not ctrl_ok and cpu_pct is not None:
                     ctrl_ok = True
-                samples.append(_mk("controller_conn_ok",    "control", node.id, 1.0 if ctrl_ok else 0.0, {"source": "curl"}))
+                node_samples.append(_mk("controller_conn_ok",    "control", node.id, 1.0 if ctrl_ok else 0.0, {"source": "curl"}))
                 if ctrl_latency_ms is not None:
-                    samples.append(_mk("controller_latency_ms", "control", node.id, ctrl_latency_ms, {"source": "curl"}))
+                    node_samples.append(_mk("controller_latency_ms", "control", node.id, ctrl_latency_ms, {"source": "curl"}))
 
-            # ── Transport: ss -s and /proc/net/snmp ──────────────────────────
-            if layer_flags.get("transport", True):
-                ss_output = _run_cmd(["docker", "exec", container, "ss", "-s"]) if container else ""
-                ss_data = _parse_ss_summary(ss_output) if ss_output else {}
-                if ss_data:
-                    samples.append(_mk("ss_sockets_total", "transport", node.id, ss_data.get("total", 0.0), {"source": "ss -s"}))
-                    samples.append(
-                        _mk(
-                            "ss_tcp_states",
-                            "transport",
-                            node.id,
-                            ss_data.get("tcp_total", 0.0),
-                            {
-                                "estab": ss_data.get("tcp_estab", 0.0),
-                                "closed": ss_data.get("tcp_closed", 0.0),
-                                "orphaned": ss_data.get("tcp_orphaned", 0.0),
-                                "timewait": ss_data.get("tcp_timewait", 0.0),
-                                "source": "ss -s",
-                            },
-                        )
-                    )
-                    for proto in ["udp", "tcp", "raw", "inet", "frag"]:
-                        samples.append(
+            if probe_out and sections:
+                seg = probe_out.split(_SCRIPT_SEP)
+                seg += [""] * (len(sections) - len(seg))
+                seg_map = dict(zip(sections, (s.strip("\n") for s in seg)))
+
+                # ── Transport: ss -s and /proc/net/snmp ──────────────────────
+                if "ss" in seg_map:
+                    ss_data = _parse_ss_summary(seg_map["ss"]) if seg_map["ss"] else {}
+                    if ss_data:
+                        node_samples.append(_mk("ss_sockets_total", "transport", node.id, ss_data.get("total", 0.0), {"source": "ss -s"}))
+                        node_samples.append(
                             _mk(
-                                f"ss_{proto}_sockets_total",
+                                "ss_tcp_states",
                                 "transport",
                                 node.id,
-                                ss_data.get(f"{proto}_total", 0.0),
+                                ss_data.get("tcp_total", 0.0),
                                 {
-                                    "ip": ss_data.get(f"{proto}_ip", 0.0),
-                                    "ipv6": ss_data.get(f"{proto}_ipv6", 0.0),
+                                    "estab": ss_data.get("tcp_estab", 0.0),
+                                    "closed": ss_data.get("tcp_closed", 0.0),
+                                    "orphaned": ss_data.get("tcp_orphaned", 0.0),
+                                    "timewait": ss_data.get("tcp_timewait", 0.0),
                                     "source": "ss -s",
                                 },
                             )
                         )
+                        for proto in ["udp", "tcp", "raw", "inet", "frag"]:
+                            node_samples.append(
+                                _mk(
+                                    f"ss_{proto}_sockets_total",
+                                    "transport",
+                                    node.id,
+                                    ss_data.get(f"{proto}_total", 0.0),
+                                    {
+                                        "ip": ss_data.get(f"{proto}_ip", 0.0),
+                                        "ipv6": ss_data.get(f"{proto}_ipv6", 0.0),
+                                        "source": "ss -s",
+                                    },
+                                )
+                            )
 
-                snmp_output = _run_cmd(["docker", "exec", container, "cat", "/proc/net/snmp"]) if container else ""
-                snmp_data = _parse_snmp(snmp_output) if snmp_output else {}
-                for key, val in snmp_data.items():
-                    samples.append(_mk(f"snmp_{key}", "transport", node.id, float(val), {"source": "/proc/net/snmp"}))
+                if "snmp" in seg_map and seg_map["snmp"]:
+                    snmp_data = _parse_snmp(seg_map["snmp"])
+                    for key, val in snmp_data.items():
+                        node_samples.append(_mk(f"snmp_{key}", "transport", node.id, float(val), {"source": "/proc/net/snmp"}))
 
-            # ── Link/Physical: ip -s link ────────────────────────────────────
-            if layer_flags.get("link", True) or layer_flags.get("physical", True):
-                ip_link_output = _run_cmd(["docker", "exec", container, "ip", "-s", "link"]) if container else ""
-                ip_link_stats = _parse_ip_link(ip_link_output) if ip_link_output else {}
+                # ── Link/Physical: ip -s link ─────────────────────────────────
+                if "iplink" in seg_map and seg_map["iplink"]:
+                    ip_link_stats = _parse_ip_link(seg_map["iplink"])
 
-                # Also grab ip link show (no -s) to detect UP/DOWN state
-                ip_link_state = _run_cmd(["docker", "exec", container, "ip", "link", "show"]) if container else ""
-                iface_up: Dict[str, bool] = {}
-                for m_st in re.finditer(r"\d+: (\S+?)[@: ].+?state (\S+)", ip_link_state):
-                    iface_up[m_st.group(1).rstrip("@")] = m_st.group(2).upper() == "UP"
+                    iface_up: Dict[str, bool] = {}
+                    for m_st in re.finditer(r"\d+: (\S+?)[@: ].+?state (\S+)", seg_map.get("iplink", "")):
+                        iface_up[m_st.group(1).rstrip("@")] = m_st.group(2).upper() == "UP"
 
-                for iface, vals in ip_link_stats.items():
-                    if iface in {"lo"}:
-                        continue
-                    path = f"{node.id}:{iface}"
-                    if layer_flags.get("physical", True):
-                        samples.append(_mk("if_errors",   "physical", path, vals.get("errors",  0.0), {"source": "ip -s link"}))
-                        samples.append(_mk("if_discards", "physical", path, vals.get("dropped", 0.0), {"source": "ip -s link"}))
+                    for iface, vals in ip_link_stats.items():
+                        if iface in {"lo"}:
+                            continue
+                        path = f"{node.id}:{iface}"
+                        if layer_flags.get("physical", True):
+                            node_samples.append(_mk("if_errors",   "physical", path, vals.get("errors",  0.0), {"source": "ip -s link"}))
+                            node_samples.append(_mk("if_discards", "physical", path, vals.get("dropped", 0.0), {"source": "ip -s link"}))
 
-                    if layer_flags.get("link", True):
-                        samples.append(_mk("queue_drops", "link", path, vals.get("dropped", 0.0), {"source": "ip -s link"}))
-                        up_val = float(iface_up.get(iface, True))
-                        samples.append(_mk("if_link_up", "link", path, up_val, {"source": "ip link show"}))
+                        if layer_flags.get("link", True):
+                            node_samples.append(_mk("queue_drops", "link", path, vals.get("dropped", 0.0), {"source": "ip -s link"}))
+                            up_val = float(iface_up.get(iface, True))
+                            node_samples.append(_mk("if_link_up", "link", path, up_val, {"source": "ip link show"}))
 
-                        # Delta-based utilization: compare with previous reading
-                        prev_key = f"{node.id}:{iface}"
-                        rx_bytes = vals.get("rx_bytes", 0.0)
-                        tx_bytes = vals.get("tx_bytes", 0.0)
-                        prev = _prev_net_stats.get(prev_key)
-                        if prev is not None:
-                            prev_rx, prev_tx, prev_ts = prev
-                            dt = now_ts - prev_ts
-                            if dt > 0:
-                                rx_bps = (rx_bytes - prev_rx) / dt
-                                tx_bps = (tx_bytes - prev_tx) / dt
-                                capacity_bps = 1_000_000_000.0  # assume 1 Gbps
-                                util = round(max(rx_bps, tx_bps) / capacity_bps * 100.0, 3)
-                                util = max(0.0, min(100.0, util))
-                                samples.append(_mk("if_in_util_pct",  "link", path, round(rx_bps / capacity_bps * 100.0, 3), {"source": "ip -s link delta"}))
-                                samples.append(_mk("if_out_util_pct", "link", path, round(tx_bps / capacity_bps * 100.0, 3), {"source": "ip -s link delta"}))
-                                # Emit per-link util using source->target key as well
-                                samples.append(_mk("link_util_pct", "link", path, util, {"source": "ip -s link delta"}))
-                        _prev_net_stats[prev_key] = (rx_bytes, tx_bytes, now_ts)
+                            # Delta-based utilization: compare with previous reading
+                            prev_key = f"{node.id}:{iface}"
+                            rx_bytes = vals.get("rx_bytes", 0.0)
+                            tx_bytes = vals.get("tx_bytes", 0.0)
+                            prev = _prev_net_stats.get(prev_key)
+                            if prev is not None:
+                                prev_rx, prev_tx, prev_ts = prev
+                                dt = now_ts - prev_ts
+                                if dt > 0:
+                                    rx_bps = (rx_bytes - prev_rx) / dt
+                                    tx_bps = (tx_bytes - prev_tx) / dt
+                                    capacity_bps = 1_000_000_000.0  # assume 1 Gbps
+                                    util = round(max(rx_bps, tx_bps) / capacity_bps * 100.0, 3)
+                                    util = max(0.0, min(100.0, util))
+                                    node_samples.append(_mk("if_in_util_pct",  "link", path, round(rx_bps / capacity_bps * 100.0, 3), {"source": "ip -s link delta"}))
+                                    node_samples.append(_mk("if_out_util_pct", "link", path, round(tx_bps / capacity_bps * 100.0, 3), {"source": "ip -s link delta"}))
+                                    # Emit per-link util using source->target key as well
+                                    node_samples.append(_mk("link_util_pct", "link", path, util, {"source": "ip -s link delta"}))
+                            _prev_net_stats[prev_key] = (rx_bytes, tx_bytes, now_ts)
 
-            # ── Network: ping between hosts ──────────────────────────────────
-            if layer_flags.get("network", True) and node.type == "host":
-                peers = [n for n in topology.nodes if n.type == "host" and n.id != node.id and n.mgmt_ip]
-                if peers:
-                    target = peers[0]
-                    ping_cmd = ["docker", "exec", container, "ping", "-c", "3", "-i", "0.2", target.mgmt_ip]
-                    ping_output = _run_cmd(ping_cmd)
-                    m = re.search(r"(\d+)% packet loss", ping_output)
-                    loss = float(m.group(1)) if m else 0.0
-                    rtt_match = re.search(r"rtt min/avg/max/mdev = ([0-9.]+)/([0-9.]+)/([0-9.]+)/([0-9.]+)", ping_output)
-                    if rtt_match:
-                        latency = float(rtt_match.group(2))
-                        jitter = float(rtt_match.group(4))
-                    else:
-                        latency = 0.0
-                        jitter = 0.0
-                    samples.append(_mk("latency_ms",      "network", node.id, latency, {"dst": target.id, "source": "ping"}))
-                    samples.append(_mk("packet_loss_pct", "network", node.id, loss,    {"dst": target.id, "source": "ping"}))
-                    samples.append(_mk("jitter_ms",       "network", node.id, jitter,  {"dst": target.id, "source": "ping"}))
+                # ── Network: ping between hosts ───────────────────────────────
+                if "ping" in seg_map and seg_map["ping"]:
+                    peers = [n for n in topology.nodes if n.type == "host" and n.id != node.id and n.mgmt_ip]
+                    if peers:
+                        target = peers[0]
+                        ping_output = seg_map["ping"]
+                        m = re.search(r"(\d+)% packet loss", ping_output)
+                        loss = float(m.group(1)) if m else 0.0
+                        rtt_match = re.search(r"rtt min/avg/max/mdev = ([0-9.]+)/([0-9.]+)/([0-9.]+)/([0-9.]+)", ping_output)
+                        if rtt_match:
+                            latency = float(rtt_match.group(2))
+                            jitter = float(rtt_match.group(4))
+                        else:
+                            latency = 0.0
+                            jitter = 0.0
+                        node_samples.append(_mk("latency_ms",      "network", node.id, latency, {"dst": target.id, "source": "ping"}))
+                        node_samples.append(_mk("packet_loss_pct", "network", node.id, loss,    {"dst": target.id, "source": "ping"}))
+                        node_samples.append(_mk("jitter_ms",       "network", node.id, jitter,  {"dst": target.id, "source": "ping"}))
 
-            # ── Control/Dataplane: OVS on switches ───────────────────────────
-            if node.type == "switch":
-                # Auto-detect OVS bridge name
-                bridge_list = _run_cmd(["docker", "exec", container, "ovs-vsctl", "list-br"])
-                bridges = [b.strip() for b in bridge_list.splitlines() if b.strip()]
-                bridge = bridges[0] if bridges else f"br-{node.id}"
+            # ── Control/Dataplane: OVS on switches ────────────────────────────
+            if extra_kind == "switch":
+                raw_parts = extra_out.split(_SCRIPT_SEP)
+                bridge_line = raw_parts[0] if raw_parts else ""
+                bridge = bridge_line.split("BRIDGE:")[-1].strip() or f"br-{node.id}"
+                ofctl_ports = raw_parts[1].strip() if len(raw_parts) > 1 else ""
+                flows_dump = raw_parts[2].strip() if len(raw_parts) > 2 else ""
 
-                if layer_flags.get("control", True):
-                    ofctl_ports = _run_cmd(["docker", "exec", container, "ovs-ofctl", "dump-ports", bridge])
-                    if ofctl_ports:
-                        samples.append(_mk("controller_conn_ok", "control", node.id, 1.0, {"source": "ovs-ofctl", "bridge": bridge}))
-                        # Parse per-port rx/tx from dump-ports
-                        port_rx = re.findall(r"rx pkts=(\d+)", ofctl_ports)
-                        port_tx = re.findall(r"tx pkts=(\d+)", ofctl_ports)
-                        total_rx = sum(int(x) for x in port_rx)
-                        total_tx = sum(int(x) for x in port_tx)
-                        samples.append(_mk("port_rx_pkts", "dataplane", node.id, float(total_rx), {"source": "ovs-ofctl", "bridge": bridge}))
-                        samples.append(_mk("port_tx_pkts", "dataplane", node.id, float(total_tx), {"source": "ovs-ofctl", "bridge": bridge}))
-                        # Drop counters
-                        port_drop = re.findall(r"tx drop=(\d+)", ofctl_ports)
-                        total_drop = sum(int(x) for x in port_drop)
-                        samples.append(_mk("port_tx_drops", "dataplane", node.id, float(total_drop), {"source": "ovs-ofctl", "bridge": bridge}))
-                        # Queue occupancy proxy: drop% as occupancy
-                        if total_tx > 0:
-                            occ = round(total_drop / total_tx * 100.0, 3)
-                            samples.append(_mk("queue_occupancy_pct", "link", node.id, occ, {"source": "ovs-ofctl"}))
+                if layer_flags.get("control", True) and ofctl_ports:
+                    node_samples.append(_mk("controller_conn_ok", "control", node.id, 1.0, {"source": "ovs-ofctl", "bridge": bridge}))
+                    # Parse per-port rx/tx from dump-ports
+                    port_rx = re.findall(r"rx pkts=(\d+)", ofctl_ports)
+                    port_tx = re.findall(r"tx pkts=(\d+)", ofctl_ports)
+                    total_rx = sum(int(x) for x in port_rx)
+                    total_tx = sum(int(x) for x in port_tx)
+                    node_samples.append(_mk("port_rx_pkts", "dataplane", node.id, float(total_rx), {"source": "ovs-ofctl", "bridge": bridge}))
+                    node_samples.append(_mk("port_tx_pkts", "dataplane", node.id, float(total_tx), {"source": "ovs-ofctl", "bridge": bridge}))
+                    # Drop counters
+                    port_drop = re.findall(r"tx drop=(\d+)", ofctl_ports)
+                    total_drop = sum(int(x) for x in port_drop)
+                    node_samples.append(_mk("port_tx_drops", "dataplane", node.id, float(total_drop), {"source": "ovs-ofctl", "bridge": bridge}))
+                    # Queue occupancy proxy: drop% as occupancy
+                    if total_tx > 0:
+                        occ = round(total_drop / total_tx * 100.0, 3)
+                        node_samples.append(_mk("queue_occupancy_pct", "link", node.id, occ, {"source": "ovs-ofctl"}))
 
-                if layer_flags.get("dataplane", True):
-                    flows_dump = _run_cmd(["docker", "exec", container, "ovs-ofctl", "dump-flows", bridge])
-                    if flows_dump:
-                        flow_lines = [ln for ln in flows_dump.splitlines() if "n_packets" in ln]
-                        for idx, ln in enumerate(flow_lines[:10]):
-                            m_pkts  = re.search(r"n_packets=(\d+)", ln)
-                            m_bytes = re.search(r"n_bytes=(\d+)", ln)
-                            pkts = float(m_pkts.group(1))  if m_pkts  else 0.0
-                            byt  = float(m_bytes.group(1)) if m_bytes else 0.0
-                            samples.append(_mk("openflow_flow_packets", "dataplane", node.id, pkts, {"flow_id": f"flow_{idx}", "source": "ovs-ofctl"}))
-                            samples.append(_mk("openflow_flow_bytes",   "dataplane", node.id, byt,  {"flow_id": f"flow_{idx}", "source": "ovs-ofctl"}))
-                        total_pkts  = sum(float(re.search(r"n_packets=(\d+)", ln).group(1)) for ln in flow_lines if re.search(r"n_packets=(\d+)", ln))
-                        total_bytes = sum(float(re.search(r"n_bytes=(\d+)",   ln).group(1)) for ln in flow_lines if re.search(r"n_bytes=(\d+)",   ln))
-                        samples.append(_mk("flows_installed", "control",   node.id, float(len(flow_lines)),  {"source": "ovs-ofctl"}))
-                        samples.append(_mk("table_hits",      "dataplane", node.id, round(total_pkts, 0),   {"source": "ovs-ofctl"}))
-                        samples.append(_mk("table_misses",    "dataplane", node.id, 0.0,                    {"source": "ovs-ofctl"}))
+                if layer_flags.get("dataplane", True) and flows_dump:
+                    flow_lines = [ln for ln in flows_dump.splitlines() if "n_packets" in ln]
+                    for idx, ln in enumerate(flow_lines[:10]):
+                        m_pkts  = re.search(r"n_packets=(\d+)", ln)
+                        m_bytes = re.search(r"n_bytes=(\d+)", ln)
+                        pkts = float(m_pkts.group(1))  if m_pkts  else 0.0
+                        byt  = float(m_bytes.group(1)) if m_bytes else 0.0
+                        node_samples.append(_mk("openflow_flow_packets", "dataplane", node.id, pkts, {"flow_id": f"flow_{idx}", "source": "ovs-ofctl"}))
+                        node_samples.append(_mk("openflow_flow_bytes",   "dataplane", node.id, byt,  {"flow_id": f"flow_{idx}", "source": "ovs-ofctl"}))
+                    total_pkts  = sum(float(re.search(r"n_packets=(\d+)", ln).group(1)) for ln in flow_lines if re.search(r"n_packets=(\d+)", ln))
+                    node_samples.append(_mk("flows_installed", "control",   node.id, float(len(flow_lines)),  {"source": "ovs-ofctl"}))
+                    node_samples.append(_mk("table_hits",      "dataplane", node.id, round(total_pkts, 0),   {"source": "ovs-ofctl"}))
+                    node_samples.append(_mk("table_misses",    "dataplane", node.id, 0.0,                    {"source": "ovs-ofctl"}))
 
         except Exception as e:
             logger.error(f"Erro ao coletar métricas do nó {node.id}: {e}")
-            continue
+        return node_samples
+
+    # ── Collect every node concurrently instead of serially ──────────────────
+    per_node = await asyncio.gather(*(_collect_node(node) for node in topology.nodes))
+    samples: List[MetricSample] = [s for group in per_node for s in group]
 
     # ── Emit per-link (source->target) aggregated metrics ───────────────────
     for link in topology.links:
@@ -885,7 +1209,10 @@ def _collect_synthetic_full(topology: Topology | None, labels: Dict[str, Any] | 
             metric=metric,
             value=value,
             details=details or {},
-            labels=_normalize_labels(labels or base_labels),
+            # base_labels is already normalized once above; only re-normalize
+            # when a call site passes a distinct per-sample override, instead
+            # of rebuilding the same 7-key dict for every sample in the cycle.
+            labels=_normalize_labels(labels) if labels else base_labels,
         )
 
     if layer_flags.get("physical", True):
@@ -1217,25 +1544,72 @@ def _sample_to_dict(sample: MetricSample) -> Dict[str, Any]:
     }
 
 
-async def _event_stream():
-    while True:
-        topology = next(iter(topologies.values()), None)
-        # O(|unique_keys|) instead of O(|all_samples|)
-        def_names = {d.name for d in metric_definitions}
-        latest_for_defs = [
-            s for s in _samples_latest.values()
-            if s.metric in def_names
-        ]
+# Rendered once per _store_samples() call and shared by every connected SSE
+# client. Before this, each client's own generator recomputed the full
+# snapshot (topology dump + every run's dump + jsonable_encoder over the
+# whole tree) independently on every wake — with N tabs/dashboards open that
+# was N redundant passes over the same data, every single cycle.
+_sse_cached_frame: str | None = None
+# Monotonically bumped every time the cache is rebuilt. Multiple concurrent
+# SSE clients each track their own last-seen version instead of racing to
+# clear a single shared Event — with a bare Event, whichever client's
+# generator happened to call .clear() first could strand the others in
+# .wait() until the *next* update, silently dropping a frame for them.
+_sse_version = 0
 
-        payload = {
-            "type": "snapshot",
-            "generated_at": datetime.utcnow().isoformat(),
-            "topology": topology.model_dump() if topology else None,
-            "metrics": [_sample_to_dict(s) for s in latest_for_defs],
-            "runs": [run.model_dump() for run in runs.values()],
-        }
-        yield f"data: {json.dumps(jsonable_encoder(payload))}\n\n"
-        await asyncio.sleep(2)
+
+def _refresh_sse_cache() -> None:
+    global _sse_cached_frame, _sse_version
+    t0 = time.perf_counter()
+    topology = next(iter(topologies.values()), None)
+    # O(|unique_keys|) instead of O(|all_samples|)
+    def_names = {d.name for d in metric_definitions}
+    latest_for_defs = [
+        s for s in _samples_latest.values()
+        if s.metric in def_names
+    ]
+    payload = {
+        "type": "snapshot",
+        "generated_at": datetime.utcnow().isoformat(),
+        # mode="json" serializes datetimes/enums inline, so the payload is
+        # already fully JSON-native — no need for a second jsonable_encoder
+        # pass walking the whole (potentially large) tree again.
+        "topology": topology.model_dump(mode="json") if topology else None,
+        "metrics": [_sample_to_dict(s) for s in latest_for_defs],
+        "runs": [run.model_dump(mode="json") for run in runs.values()],
+    }
+    _sse_cached_frame = f"data: {json.dumps(payload)}\n\n"
+    _sse_version += 1
+    _profile_record("sse_cache_refresh", (time.perf_counter() - t0) * 1000)
+
+
+async def _event_stream():
+    # Event-driven push: wake as soon as a collection cycle stores new
+    # samples instead of polling on a fixed 2s tick. A bounded wait_for keeps
+    # a heartbeat flowing (and the connection alive) even when nothing changed.
+    #
+    # Correctness note: each client tracks its own `last_seen` version
+    # instead of relying purely on the shared Event's set/clear state, so
+    # one client's timing can't steal or drop another client's wakeup the
+    # way a bare clear-on-consume Event would with multiple readers. The
+    # version check is re-done immediately after clear() (with no `await`
+    # in between, so nothing else can run on this single-threaded loop in
+    # that gap) to close the lost-wakeup window against a producer update
+    # landing concurrently — including one delivered via
+    # call_soon_threadsafe from the auto-collect worker thread.
+    if _sse_cached_frame is None:
+        _refresh_sse_cache()
+    last_seen = -1
+    while True:
+        if _sse_version == last_seen:
+            _samples_updated.clear()
+            if _sse_version == last_seen:
+                try:
+                    await asyncio.wait_for(_samples_updated.wait(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    pass
+        last_seen = _sse_version
+        yield _sse_cached_frame
 
 
 def require_api_key(x_api_key: str | None = Header(default=None)) -> None:
@@ -1258,10 +1632,18 @@ run_metrics: Dict[str, List[MetricRecord]] = {}
 MAX_SAMPLES = int(os.getenv("MAX_METRIC_SAMPLES", "50000"))
 _samples_latest: Dict[str, MetricSample] = {}
 metric_samples: deque = deque(maxlen=MAX_SAMPLES)
+# Signals SSE subscribers as soon as new samples land, replacing fixed polling.
+_samples_updated: asyncio.Event = asyncio.Event()
+_main_loop: asyncio.AbstractEventLoop | None = None
 seen_metric_names: set[str] = set()
 layer_flags: Dict[MetricLayer, bool] = metric_layer_flags({})
 real_collection_default = os.getenv("REAL_COLLECTION", "0") == "1"
-collection_interval_seconds = float(os.getenv("AUTO_COLLECT_INTERVAL", "5"))
+# Raised from 5s: with SSE now pushing instantly on every store (not on a
+# fixed poll), end-to-end delivery latency no longer tracks this interval —
+# it only trades data *freshness* for CPU, and CPU is the tight constraint.
+# Override via env if a given experiment needs tighter freshness than CPU
+# budget allows.
+collection_interval_seconds = float(os.getenv("AUTO_COLLECT_INTERVAL", "15"))
 _auto_collect_task: asyncio.Task | None = None
 
 # System settings (in-memory, pode migrar para banco posteriormente)
@@ -1363,9 +1745,13 @@ async def _auto_collect_loop() -> None:
             if topology:
                 labels = {"version": software_version}
                 use_real_setting = system_settings.get("use_real_data", real_collection_default)
-                samples = _collect_real(topology, labels) if use_real_setting else _collect_synthetic_full(topology, labels)
+                samples = await _collect_real(topology, labels) if use_real_setting else _collect_synthetic_full(topology, labels)
                 if samples:
-                    _store_samples(samples)
+                    # _store_samples() does synchronous disk I/O (raw JSONL +
+                    # per-run snapshot rewrite); offload it so a slow disk
+                    # can't stall the event loop the way blocking subprocess
+                    # calls used to.
+                    await asyncio.to_thread(_store_samples, samples)
         except Exception:
             # Avoid crashing the loop; log could be added here later.
             pass
@@ -1374,7 +1760,8 @@ async def _auto_collect_loop() -> None:
 
 @app.on_event("startup")
 async def _start_auto_collect() -> None:
-    global _auto_collect_task
+    global _auto_collect_task, _main_loop
+    _main_loop = asyncio.get_running_loop()
     if _auto_collect_task is None:
         _auto_collect_task = asyncio.create_task(_auto_collect_loop())
 
@@ -1388,6 +1775,12 @@ async def _stop_auto_collect() -> None:
             await _auto_collect_task
         except asyncio.CancelledError:
             pass
+    for handle in _raw_file_handles.values():
+        try:
+            handle.close()
+        except Exception:
+            pass
+    _raw_file_handles.clear()
 
 
 @app.post("/topologies", response_model=Topology, status_code=status.HTTP_201_CREATED, dependencies=[Depends(require_api_key)])
@@ -1604,7 +1997,7 @@ async def import_experiment(payload: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 continue
         run_metrics[new_run_id] = restored
-        _persist_run_metrics(new_run_id)
+        _persist_run_metrics(new_run_id, force=True)
         imported_runs.append(new_run_id)
 
     return {
@@ -1655,7 +2048,7 @@ async def start_run(experiment_id: str, mode: str = "synthetic") -> ExperimentRu
         # Usar system_settings para determinar modo de coleta
         use_real_setting = system_settings.get("use_real_data", real_collection_default)
         use_real = mode == "real" or (use_real_setting and mode != "synthetic")
-        samples = _collect_real(topology, labels) if use_real else _collect_synthetic_full(topology, labels)
+        samples = await _collect_real(topology, labels) if use_real else _collect_synthetic_full(topology, labels)
         _store_samples(samples)
         _append_run_log(run_id, f"metrics_collected:{len(samples)}")
 
@@ -1672,7 +2065,7 @@ async def start_run(experiment_id: str, mode: str = "synthetic") -> ExperimentRu
 
     try:
         _persist_run(run)
-        _persist_run_metrics(run_id)
+        _persist_run_metrics(run_id, force=True)
     except Exception:
         pass
     return run
@@ -1726,7 +2119,7 @@ async def update_system_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
             topology = next(iter(topologies.values()), None)
             new_mode_real = settings["use_real_data"]
             try:
-                new_samples = _collect_real(topology, {"version": software_version}) if new_mode_real else _collect_synthetic_full(topology, {"version": software_version})
+                new_samples = await _collect_real(topology, {"version": software_version}) if new_mode_real else _collect_synthetic_full(topology, {"version": software_version})
                 if new_samples:
                     _store_samples(new_samples)
             except Exception as exc:
@@ -2085,8 +2478,64 @@ async def collect_metrics(
     topology = topologies.get(topology_id) if topology_id else next(iter(topologies.values()), None)
     use_real_setting = system_settings.get("use_real_data", real_collection_default)
     use_real = mode == "real" or (use_real_setting and mode != "synthetic")
-    samples = _collect_real(topology, labels) if use_real else _collect_synthetic_full(topology, labels)
+    samples = await _collect_real(topology, labels) if use_real else _collect_synthetic_full(topology, labels)
     _store_samples(samples)
     if run_id:
         _append_run_log(run_id, "metrics_collected")
     return {"collected": len(samples), "mode": "real" if use_real else "synthetic"}
+
+
+@app.get("/debug/collect_profile", response_model=Dict[str, Any], dependencies=[Depends(require_api_key)])
+async def debug_collect_profile() -> Dict[str, Any]:
+    """Runs one real _collect_real() cycle and returns a wall-time breakdown
+    by phase (see _profile_record above) rather than cProfile. cProfile only
+    instruments the thread it's enabled on, and almost all the actual work
+    here (_run_cmd, _docker_exec_sync, docker stats) runs inside
+    asyncio.to_thread() worker threads it would never see.
+
+    The stats dict lives in a ContextVar scoped to this request's own Task,
+    not a bare global — so a background _auto_collect_loop cycle firing
+    concurrently (a real race in an earlier version of this endpoint) writes
+    into ITS OWN (default/unset) context and simply can't contaminate this
+    call's numbers, no matter how the two interleave.
+
+    Point this at the real lab host (with a Docker daemon) to see whether
+    time is still going into `docker_cli_fallback` (check
+    `docker_sdk_client_available` / `docker_sdk_client_error` below for why)
+    versus `docker_sdk_exec`, and how that compares to
+    `sse_cache_refresh`/`raw_file_write` (Python-side cost) and the total
+    cycle wall time.
+
+    Side effect: like /metrics/collect, this actually stores the collected
+    samples (labeled version="profile") and notifies real SSE subscribers —
+    it profiles the genuine end-to-end path, not a sandboxed copy of it.
+    """
+    stats: Dict[str, Dict[str, float]] = {}
+    token = _profile_ctx.set(stats)
+    t0 = time.perf_counter()
+    try:
+        topology = next(iter(topologies.values()), None)
+        use_real_setting = system_settings.get("use_real_data", real_collection_default)
+        samples = (
+            await _collect_real(topology, {"version": "profile"})
+            if use_real_setting
+            else _collect_synthetic_full(topology, {"version": "profile"})
+        )
+        _store_samples(samples)
+    finally:
+        _profile_ctx.reset(token)
+    cycle_ms = (time.perf_counter() - t0) * 1000
+
+    breakdown = {
+        name: {"calls": int(v["count"]), "total_ms": round(v["total_ms"], 2)}
+        for name, v in sorted(stats.items(), key=lambda kv: -kv[1]["total_ms"])
+    }
+    docker_client_ok = _get_docker_client() is not None
+    return {
+        "mode": "real" if use_real_setting else "synthetic",
+        "samples_collected": len(samples),
+        "cycle_wall_ms": round(cycle_ms, 2),
+        "docker_sdk_client_available": docker_client_ok,
+        "docker_sdk_client_error": None if docker_client_ok else _docker_client_error,
+        "by_phase": breakdown,
+    }

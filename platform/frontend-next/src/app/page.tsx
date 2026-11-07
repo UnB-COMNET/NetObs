@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { AreaMini } from "@/components/viz/AreaMini";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
@@ -22,7 +22,8 @@ import {
   type MetricType,
 } from "@/lib/metricsCatalog";
 import { cn } from "@/lib/cn";
-import { API_BASE, metricsApi, topologyApi, type MetricSample, type Topology } from "@/lib/api";
+import { API_BASE, topologyApi, type MetricSample, type Topology } from "@/lib/api";
+import { useSSE } from "@/hooks/useSSE";
 
 // Classifica um node real do backend no EntityKind correspondente
 function classifyNode(node: string): EntityKind | null {
@@ -324,29 +325,22 @@ export default function DashboardPage() {
   }, [timeFilter]);
 
   // ── Live backend metrics ──────────────────────────────────────────────────
+  // Pushed by the backend's SSE stream (/stream/events) as soon as a new
+  // collection cycle lands, instead of a fixed 5s REST poll — the backend
+  // itself no longer batches on a timer, so polling here just added latency
+  // and redundant requests on top of a connection we already hold open.
+  const { snapshot, connected: sseConnected } = useSSE();
   const [liveMetrics, setLiveMetrics] = useState<MetricSample[]>([]);
   const [backendOnline, setBackendOnline] = useState<boolean | null>(null); // null = unknown
-  const liveTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  const fetchLiveMetrics = useCallback(() => {
-    metricsApi
-      .latest()
-      .then((samples) => {
-        setLiveMetrics(samples);
-        setBackendOnline(true);
-      })
-      .catch(() => {
-        setBackendOnline(false);
-      });
-  }, []);
 
   useEffect(() => {
-    fetchLiveMetrics();
-    liveTimerRef.current = setInterval(fetchLiveMetrics, 5000);
-    return () => {
-      if (liveTimerRef.current) clearInterval(liveTimerRef.current);
-    };
-  }, [fetchLiveMetrics]);
+    if (snapshot) {
+      setLiveMetrics(snapshot.metrics);
+      setBackendOnline(true);
+    } else if (!sseConnected) {
+      setBackendOnline((prev) => (prev === null ? null : false));
+    }
+  }, [snapshot, sseConnected]);
 
   // Derivar instâncias reais dos metrics do backend
   const entityInstances = useMemo<Record<EntityKind, string[]>>(() => {

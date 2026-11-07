@@ -2,7 +2,8 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { Badge } from "@/components/ui/Badge";
-import { metricsApi, type MetricSample } from "@/lib/api";
+import { type MetricSample } from "@/lib/api";
+import { useSSE } from "@/hooks/useSSE";
 
 function formatGiB(bytes: number) {
   return `${(bytes / 1024 / 1024 / 1024).toFixed(1)} GiB`;
@@ -55,34 +56,29 @@ function extractResources(samples: MetricSample[]): ResourceData {
 export function StatusBar() {
   const [resources, setResources] = useState<ResourceData>(FALLBACK);
   const [controllerOnline, setControllerOnline] = useState<boolean | null>(null);
+  // SSE snapshot already carries every layer/metric; filtering it client-side
+  // replaces two separate 5s-polled REST calls with zero extra requests.
+  const { snapshot, connected } = useSSE();
 
   useEffect(() => {
-    async function poll() {
-      try {
-        const [cpuSamples, connSamples] = await Promise.all([
-          metricsApi.latest({ layer: "control" }),
-          metricsApi.latest({ metric: "controller_conn_ok" }),
-        ]);
-
-        setResources(extractResources(cpuSamples));
-
-        const connSample = connSamples.find((s) => s.metric === "controller_conn_ok");
-        if (connSample !== undefined) {
-          setControllerOnline(connSample.value > 0.5);
-        } else {
-          // Se não há sample de conn, assume online se há qualquer dado
-          setControllerOnline(cpuSamples.length > 0);
-        }
-      } catch {
+    if (!snapshot) {
+      if (!connected) {
         setResources(FALLBACK);
         setControllerOnline(false);
       }
+      return;
     }
+    const cpuSamples = snapshot.metrics.filter((s) => s.layer === "control");
+    setResources(extractResources(cpuSamples));
 
-    poll();
-    const id = setInterval(poll, 5000);
-    return () => clearInterval(id);
-  }, []);
+    const connSample = snapshot.metrics.find((s) => s.metric === "controller_conn_ok");
+    if (connSample !== undefined) {
+      setControllerOnline(connSample.value > 0.5);
+    } else {
+      // Se não há sample de conn, assume online se há qualquer dado
+      setControllerOnline(cpuSamples.length > 0);
+    }
+  }, [snapshot, connected]);
 
   const cpuTone = resources.cpuPct === null ? "neutral" : resources.cpuPct > 85 ? "danger" : resources.cpuPct > 60 ? "neutral" : "ok";
   const memTone = resources.memPct === null ? "neutral" : resources.memPct > 90 ? "danger" : resources.memPct > 70 ? "neutral" : "ok";

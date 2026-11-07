@@ -505,6 +505,8 @@ METRIC_CATALOG: List[MetricDefinition] = [
     md("flows_removed", "Flows removed", unit="count", layer="control", kind="counter", category="control", dimensions=["controller", "switch"]),
     md("cpu_util_pct", "CPU utilization", unit="%", layer="control", kind="gauge", category="host", dimensions=["node"]),
     md("mem_util_pct", "Memory utilization", unit="%", layer="control", kind="gauge", category="host", dimensions=["node"]),
+    md("docker_cpu_util_pct", "CPU utilization (Docker container)", unit="%", layer="control", kind="gauge", category="host", dimensions=["node"]),
+    md("docker_mem_util_pct", "Memory utilization (Docker container)", unit="%", layer="control", kind="gauge", category="host", dimensions=["node"]),
 
     # Dataplane (platform)
     md("openflow_flow_packets", "Flow packets", unit="packets", layer="dataplane", kind="counter", category="dataplane", dimensions=["switch", "table", "flow"]),

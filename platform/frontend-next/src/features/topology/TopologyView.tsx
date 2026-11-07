@@ -17,6 +17,7 @@ import { cn } from "@/lib/cn";
 import { topologyApi, metricsApi, type MetricSample, API_BASE } from "@/lib/api";
 import { Button } from "@/components/ui/Button";
 import { Activity, RefreshCw, X } from "lucide-react";
+import { useSSE } from "@/hooks/useSSE";
 
 // ─── Types ─────────────────────────────────────────────────────────────────
 
@@ -204,7 +205,12 @@ function TopologyViewInner() {
   // Load on mount, and whenever data mode changes
   useEffect(() => { loadTopology(); }, [loadTopology, dataModeReal]);
 
-  // ── Poll global metrics every 5s (updates canvas nodes + edges) ────────
+  // ── Live global metrics (updates canvas nodes + edges) ──────────────────
+  // Driven by the SSE stream instead of a 5s REST poll: the backend already
+  // pushes a fresh snapshot the moment a collection cycle completes, so a
+  // separate timer here just duplicated that traffic and added up to 5s of
+  // extra staleness on top of it.
+  const { snapshot: liveSnapshot } = useSSE();
   useEffect(() => {
     const apply = (samples: MetricSample[]) => {
       setLastRefresh(new Date());
@@ -256,10 +262,13 @@ function TopologyViewInner() {
       );
     };
 
-    metricsApi.latest().then(apply).catch(() => {});
-    const t = setInterval(() => metricsApi.latest().then(apply).catch(() => {}), 5000);
-    return () => clearInterval(t);
-  }, []);
+    if (liveSnapshot) {
+      apply(liveSnapshot.metrics);
+    } else {
+      // Cold-start fallback before the first SSE frame arrives.
+      metricsApi.latest().then(apply).catch(() => {});
+    }
+  }, [liveSnapshot]);
 
   // ── Poll per-node/edge metrics on selection ────────────────────────────
   useEffect(() => {
