@@ -649,11 +649,81 @@ def _get_docker_client() -> Any:
     return _docker_client
 
 
+# v2: exec direto pela Engine API (socket unix), sem fork do CLI `docker` por sonda e sem
+# depender do docker-py. ENGINE_API_EXEC=0 restaura o caminho anterior (SDK/CLI).
+ENGINE_API_EXEC = os.getenv("ENGINE_API_EXEC", "1") == "1"
+# v2: sondas de rapida+extra de um mesmo no vao num unico exec (menos execs por ciclo).
+MERGE_EXEC = os.getenv("MERGE_EXEC", "1") == "1"
+_DOCKER_SOCK = os.getenv("DOCKER_SOCK_PATH", "/var/run/docker.sock")
+_PART_SEP = "###NETOPS_PART###"
+
+
+def _engine_request(method: str, path: str, body: dict | None = None, timeout: float = 12.0) -> tuple[int, bytes]:
+    import socket
+    payload = json.dumps(body).encode() if body is not None else b""
+    req = (f"{method} {path} HTTP/1.1\r\nHost: docker\r\nConnection: close\r\n"
+           f"Content-Type: application/json\r\nContent-Length: {len(payload)}\r\n\r\n").encode() + payload
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(_DOCKER_SOCK)
+        s.sendall(req)
+        chunks = []
+        while True:
+            b = s.recv(65536)
+            if not b:
+                break
+            chunks.append(b)
+    finally:
+        s.close()
+    raw = b"".join(chunks)
+    head, _, data = raw.partition(b"\r\n\r\n")
+    status = int(head.split(b" ", 2)[1])
+    if b"transfer-encoding: chunked" in head.lower():
+        out, i = b"", 0
+        while i < len(data):
+            j = data.find(b"\r\n", i)
+            if j < 0:
+                break
+            n = int(data[i:j].split(b";")[0] or b"0", 16)
+            if n == 0:
+                break
+            out += data[j + 2:j + 2 + n]
+            i = j + 2 + n + 2
+        data = out
+    return status, data
+
+
+def _engine_exec(container: str, script: str) -> str:
+    st, data = _engine_request("POST", f"/containers/{container}/exec", {
+        "AttachStdout": True, "AttachStderr": True, "Tty": False, "Cmd": ["sh", "-c", script + " ; true"]})
+    if st != 201:
+        raise RuntimeError(f"exec create {st}")
+    eid = json.loads(data)["Id"]
+    st, data = _engine_request("POST", f"/exec/{eid}/start", {"Detach": False, "Tty": False})
+    if st != 200:
+        raise RuntimeError(f"exec start {st}")
+    out, i = [], 0
+    while i + 8 <= len(data):   # fluxo multiplexado: 8 bytes de cabecalho (tipo, 3 pad, tamanho)
+        n = int.from_bytes(data[i + 4:i + 8], "big")
+        out.append(data[i + 8:i + 8 + n])
+        i += 8 + n
+    return b"".join(out).decode("utf-8", errors="replace")
+
+
 def _docker_exec_sync(container: str, script: str) -> str:
     """SDK-based equivalent of `docker exec container sh -c script`.
     Falls back to the CLI if the SDK/daemon socket isn't reachable, so this
     degrades gracefully in environments without direct socket access."""
-    client = _get_docker_client()
+    if ENGINE_API_EXEC:
+        try:
+            t0 = time.perf_counter()
+            res = _engine_exec(container, script)
+            _profile_record("docker_engine_exec", (time.perf_counter() - t0) * 1000)
+            return res
+        except Exception:
+            pass
+    client = None if ENGINE_API_EXEC else _get_docker_client()
     full_script = script + " ; true"
     if client is None:
         return _run_cmd(["docker", "exec", container, "sh", "-c", full_script], timeout=10)
@@ -1039,10 +1109,14 @@ async def _collect_real(topology: Topology | None, labels: Dict[str, Any] | None
                     _ping_target = _peers[0].meta.get("data_ip") or _peers[0].mgmt_ip
             probe_script, sections = _build_probe_script(node, include_fast, include_slow, _ping_target)
             extra_script, extra_kind = _build_extra_script(node, include_slow)
-            probe_out, extra_out = await asyncio.gather(
-                _run_docker_script(container, probe_script) if probe_script else _empty_str(),
-                _run_docker_script(container, extra_script) if extra_script else _empty_str(),
-            )
+            if MERGE_EXEC and probe_script and extra_script:
+                _merged = await _run_docker_script(container, f"{probe_script} ; echo '{_PART_SEP}' ; {extra_script}")
+                probe_out, _, extra_out = _merged.partition(_PART_SEP)
+            else:
+                probe_out, extra_out = await asyncio.gather(
+                    _run_docker_script(container, probe_script) if probe_script else _empty_str(),
+                    _run_docker_script(container, extra_script) if extra_script else _empty_str(),
+                )
 
             # ── Controller-specific metrics ──────────────────────────────────
             if node.type == "controller" and CONTROLLER_PROBE_MODE == "http" and node.mgmt_ip and (include_slow or OVS_EVERY_CYCLE):
