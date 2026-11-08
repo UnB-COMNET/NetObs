@@ -185,8 +185,16 @@ def _write_samples_to_raw(samples: Sequence[MetricSample]) -> None:
     """Batch writes grouped by layer, reusing one open handle per layer."""
     t0 = time.perf_counter()
     by_layer: Dict[str, List[str]] = defaultdict(list)
+    lab_cache: Dict[int, str] = {}
+    dumps = json.dumps
     for sample in samples:
-        by_layer[str(sample.layer)].append(_serialize_sample(sample))
+        lj = lab_cache.get(id(sample.labels))
+        if lj is None:
+            lj = lab_cache[id(sample.labels)] = dumps(sample.labels)
+        by_layer[str(sample.layer)].append(
+            '{"timestamp": %s, "node": %s, "layer": %s, "metric": %s, "value": %s, "details": %s, "labels": %s}' % (
+                dumps(sample.timestamp.isoformat()), dumps(sample.node), dumps(sample.layer), dumps(sample.metric),
+                dumps(sample.value), dumps(sample.details), lj))
     for layer_key, lines in by_layer.items():
         f = _raw_file_handle(layer_key)
         f.write("\n".join(lines) + "\n")
@@ -469,8 +477,9 @@ def _append_run_log(run_id: str, message: str) -> None:
     run.logs.append(entry)
 
 
-def _store_samples(samples: Sequence[MetricSample]) -> None:
-    normalized = [_normalize_sample(s) for s in samples]
+def _store_samples(samples: Sequence[MetricSample], trusted: bool = False) -> None:
+    # trusted=True: amostras criadas por _collect_real() ja saem normalizadas (v4 pula a revalidacao).
+    normalized = list(samples) if trusted else [_normalize_sample(s) for s in samples]
     touched_run_ids: set[str] = set()
     for s in normalized:
         # Update O(1) latest index
@@ -507,10 +516,11 @@ def _store_samples(samples: Sequence[MetricSample]) -> None:
     # event-loop thread or from a worker thread (call_soon_threadsafe
     # handles both; the cache write itself is plain dict/pydantic work
     # under the GIL, safe from either thread).
-    try:
-        _refresh_sse_cache()
-    except Exception:
-        pass
+    if _sse_clients > 0 or SSE_ALWAYS:
+        try:
+            _refresh_sse_cache()
+        except Exception:
+            pass
     if _main_loop is not None:
         _main_loop.call_soon_threadsafe(_samples_updated.set)
     else:
@@ -1051,6 +1061,9 @@ PROC_SLOW_SEC = float(os.getenv("PROC_SLOW_SEC", "10"))
 _proc_pid_cache: Dict[str, int] = {}
 _ovs_cache: Dict[str, Dict[str, Any]] = {}
 _last_slow_ts = 0.0
+_last_ping_ts = 0.0
+# v4: a sonda ICMP propria roda a cada PING_EVERY_SEC (menos trafego proprio nos contadores do plano de dados).
+PING_EVERY_SEC = float(os.getenv("PING_EVERY_SEC", "30"))
 _OVS_SLOW_SCRIPT = (
     "br=$(ovs-vsctl list-br 2>/dev/null | head -1); echo \"BRIDGE:$br\"; "
     f"echo '{_SCRIPT_SEP}'; ovs-vsctl list-ports \"$br\" 2>/dev/null; "
@@ -1180,7 +1193,8 @@ def _proc_fast_segments(pid: int) -> Dict[str, str]:
     return seg
 
 
-async def _collect_real(topology: Topology | None, labels: Dict[str, Any] | None = None) -> List[MetricSample]:
+async def _collect_real(topology: Topology | None, labels: Dict[str, Any] | None = None, phase: str = "all") -> List[MetricSample]:
+    # v4: phase="fast" (so /proc, publicada de imediato), "slow" (ping e fluxos OVS por exec, em segundo plano), "all" (v3).
     global _collect_cycle_count
     if not topology:
         return []
@@ -1196,11 +1210,16 @@ async def _collect_real(topology: Topology | None, labels: Dict[str, Any] | None
     include_slow = (_collect_cycle_count - 1) % SLOW_PROBE_INTERVAL_CYCLES == 0
     if PROC_DIRECT:
         global _last_slow_ts
-        include_fast = True
-        # 0.9: tolera o jitter do ciclo para que, a 10 s, a camada lenta nao pule um ciclo
-        include_slow = (now_ts - _last_slow_ts) >= PROC_SLOW_SEC * 0.9
-        if include_slow:
-            _last_slow_ts = now_ts
+        if phase == "fast":
+            include_fast, include_slow = True, False
+        elif phase == "slow":
+            include_fast, include_slow = False, True
+        else:
+            include_fast = True
+            # 0.9: tolera o jitter do ciclo para que, a 10 s, a camada lenta nao pule um ciclo
+            include_slow = (now_ts - _last_slow_ts) >= PROC_SLOW_SEC * 0.9
+            if include_slow:
+                _last_slow_ts = now_ts
     global _last_stats_probe_ts
     include_stats = (now_ts - _last_stats_probe_ts) >= STATS_PROBE_INTERVAL_SEC
     if include_stats:
@@ -1225,8 +1244,14 @@ async def _collect_real(topology: Topology | None, labels: Dict[str, Any] | None
     # by STATS_PROBE_INTERVAL_CYCLES (default 1 = every cycle); when skipped,
     # cpu/mem samples simply aren't re-emitted this cycle and _samples_latest
     # keeps serving the last known reading, same as the FAST/SLOW tiers. ────
+    global _last_ping_ts
+    _ping_cycle = False
+    if include_slow and (phase != "slow" or True):
+        _ping_cycle = (now_ts - _last_ping_ts) >= PING_EVERY_SEC * 0.9
+        if _ping_cycle:
+            _last_ping_ts = now_ts
     container_names = [node.meta.get("container_name") or node.id for node in topology.nodes]
-    all_dstats = await _run_in_collection_executor(_parse_docker_stats_batch, container_names) if include_stats else {}
+    all_dstats = await _run_in_collection_executor(_parse_docker_stats_batch, container_names) if (include_stats and phase != "slow") else {}
 
     async def _collect_node(node: Any) -> List[MetricSample]:
         node_samples: List[MetricSample] = []
@@ -1255,16 +1280,17 @@ async def _collect_real(topology: Topology | None, labels: Dict[str, Any] | None
                 if _peers:
                     _ping_target = _peers[0].meta.get("data_ip") or _peers[0].mgmt_ip
             use_proc, proc_pid, local_seg = False, None, {}
+            _ping_due = (phase != "slow") or _ping_cycle
             if PROC_DIRECT and node.type in ("host", "switch"):
                 try:
                     proc_pid = _container_pid(container)
                     if proc_pid:
-                        local_seg = _proc_fast_segments(proc_pid)
+                        local_seg = _proc_fast_segments(proc_pid) if phase != "slow" else {}
                         use_proc = True
                 except Exception as exc:
                     logger.warning(f"PROC_DIRECT indisponivel para {container} ({exc}); usando exec")
                     use_proc, local_seg = False, {}
-            probe_script, sections = _build_probe_script(node, include_fast and not use_proc, include_slow, _ping_target)
+            probe_script, sections = _build_probe_script(node, include_fast and not use_proc, include_slow and (_ping_due or not use_proc), _ping_target)
             if use_proc and node.type == "switch":
                 extra_script, extra_kind = (_OVS_SLOW_SCRIPT if include_slow else ""), "switch"
             else:
@@ -1279,7 +1305,7 @@ async def _collect_real(topology: Topology | None, labels: Dict[str, Any] | None
                 )
 
             # ── Controller-specific metrics ──────────────────────────────────
-            if node.type == "controller" and CONTROLLER_PROBE_MODE == "http" and node.mgmt_ip and (include_slow or OVS_EVERY_CYCLE):
+            if node.type == "controller" and CONTROLLER_PROBE_MODE == "http" and node.mgmt_ip and phase != "slow" and (include_slow or OVS_EVERY_CYCLE):
                 _ok, _ms = await _run_in_collection_executor(_http_probe_controller, node.mgmt_ip)
                 node_samples.append(_mk("controller_conn_ok", "control", node.id, 1.0 if _ok else 0.0, {"source": "http"}))
                 if _ms is not None:
@@ -1303,7 +1329,7 @@ async def _collect_real(topology: Topology | None, labels: Dict[str, Any] | None
                     cache["bridge"] = parts[0].split("BRIDGE:")[-1].strip()
                     cache["ports"] = parts[1].split() if len(parts) > 1 else []
                     flows_fresh = parts[2].strip() if len(parts) > 2 else ""
-                ports_text = _proc_ports_text(proc_pid, cache["ports"], cache["bridge"]) if cache["ports"] else ""
+                ports_text = _proc_ports_text(proc_pid, cache["ports"], cache["bridge"]) if (cache["ports"] and phase != "slow") else ""
                 extra_out = f"BRIDGE:{cache['bridge']}{_SCRIPT_SEP}{ports_text}{_SCRIPT_SEP}{flows_fresh}"
 
             if (probe_out and sections) or local_seg:
@@ -1843,6 +1869,9 @@ _sse_cached_frame: str | None = None
 # generator happened to call .clear() first could strand the others in
 # .wait() until the *next* update, silently dropping a frame for them.
 _sse_version = 0
+# v4: so reconstroi o quadro SSE (serializa todas as series) quando ha cliente conectado.
+_sse_clients = 0
+SSE_ALWAYS = os.getenv("SSE_ALWAYS", "0") == "1"
 
 
 def _refresh_sse_cache() -> None:
@@ -1884,19 +1913,23 @@ async def _event_stream():
     # that gap) to close the lost-wakeup window against a producer update
     # landing concurrently — including one delivered via
     # call_soon_threadsafe from the auto-collect worker thread.
-    if _sse_cached_frame is None:
-        _refresh_sse_cache()
-    last_seen = -1
-    while True:
-        if _sse_version == last_seen:
-            _samples_updated.clear()
+    global _sse_clients
+    _sse_clients += 1
+    try:
+        _refresh_sse_cache()    # v4: o quadro pode estar defasado (nao e reconstruido sem clientes)
+        last_seen = -1
+        while True:
             if _sse_version == last_seen:
-                try:
-                    await asyncio.wait_for(_samples_updated.wait(), timeout=15.0)
-                except asyncio.TimeoutError:
-                    pass
-        last_seen = _sse_version
-        yield _sse_cached_frame
+                _samples_updated.clear()
+                if _sse_version == last_seen:
+                    try:
+                        await asyncio.wait_for(_samples_updated.wait(), timeout=15.0)
+                    except asyncio.TimeoutError:
+                        pass
+            last_seen = _sse_version
+            yield _sse_cached_frame
+    finally:
+        _sse_clients -= 1
 
 
 def require_api_key(x_api_key: str | None = Header(default=None)) -> None:
@@ -2024,8 +2057,23 @@ if not metric_samples:
             _store_samples(seeded)
 
 
+_slow_task: Any = None
+# v4: a camada lenta (ping, fluxos OVS) roda em segundo plano e publica quando termina, sem atrasar a rapida.
+DECOUPLE_SLOW = os.getenv("DECOUPLE_SLOW", "1") == "1"
+
+
+async def _slow_cycle(topology: Any, labels: Dict[str, Any]) -> None:
+    try:
+        samples = await _collect_real(topology, labels, phase="slow")
+        if samples:
+            await asyncio.to_thread(_store_samples, samples, True)
+    except Exception as exc:
+        logger.warning(f"camada lenta falhou: {exc}")
+
+
 async def _auto_collect_loop() -> None:
     """Continuously collect metrics to keep SSE populated."""
+    global _slow_task
     _next_deadline = time.monotonic()
     while True:
         try:
@@ -2033,13 +2081,22 @@ async def _auto_collect_loop() -> None:
             if topology:
                 labels = {"version": software_version}
                 use_real_setting = system_settings.get("use_real_data", real_collection_default)
-                samples = await _collect_real(topology, labels) if use_real_setting else _collect_synthetic_full(topology, labels)
-                if samples:
-                    # _store_samples() does synchronous disk I/O (raw JSONL +
-                    # per-run snapshot rewrite); offload it so a slow disk
-                    # can't stall the event loop the way blocking subprocess
-                    # calls used to.
-                    await asyncio.to_thread(_store_samples, samples)
+                if use_real_setting and PROC_DIRECT and DECOUPLE_SLOW:
+                    samples = await _collect_real(topology, labels, phase="fast")
+                    if samples:
+                        await asyncio.to_thread(_store_samples, samples, True)
+                    global _last_slow_ts
+                    if (time.time() - _last_slow_ts) >= PROC_SLOW_SEC * 0.9 and (_slow_task is None or _slow_task.done()):
+                        _last_slow_ts = time.time()
+                        _slow_task = asyncio.create_task(_slow_cycle(topology, labels))
+                else:
+                    samples = await _collect_real(topology, labels) if use_real_setting else _collect_synthetic_full(topology, labels)
+                    if samples:
+                        # _store_samples() does synchronous disk I/O (raw JSONL +
+                        # per-run snapshot rewrite); offload it so a slow disk
+                        # can't stall the event loop the way blocking subprocess
+                        # calls used to.
+                        await asyncio.to_thread(_store_samples, samples)
         except Exception:
             # Avoid crashing the loop; log could be added here later.
             pass
