@@ -850,6 +850,16 @@ def _parse_ss_summary(output: str) -> Dict[str, float]:
     return {**summary, **{f"{proto}_{k}": v for proto, vals in matrix.items() for k, v in vals.items()}}
 
 
+# v5: emite apenas os contadores SNMP usados pelas camadas (SNMP_ALLOWLIST=0 restaura todos).
+_SNMP_CORE = (
+    "ip_inreceives ip_outrequests ip_indiscards ip_outdiscards ip_inhdrerrors "
+    "icmp_inmsgs icmp_outmsgs icmp_inechos icmp_outechos icmp_inechoreps icmp_outechoreps icmp_inerrors "
+    "tcp_currestab tcp_insegs tcp_outsegs tcp_retranssegs tcp_inerrs tcp_outrsts tcp_activeopens tcp_passiveopens "
+    "udp_indatagrams udp_outdatagrams udp_inerrors udp_noports"
+).split()
+SNMP_ALLOW = set(_SNMP_CORE) if os.getenv("SNMP_ALLOWLIST", "1") == "1" else set()
+
+
 def _parse_snmp(output: str) -> Dict[str, float]:
     lines = [ln for ln in output.splitlines() if ":" in ln]
     results: Dict[str, float] = {}
@@ -1057,7 +1067,7 @@ def _http_probe_controller(host: str, ports: tuple = (8080, 8181), timeout: floa
 # (que dependem de processos dentro do container) rodam por `exec` a cada PROC_SLOW_SEC segundos
 # (tempo de parede, nao numero de ciclos).
 PROC_DIRECT = os.getenv("PROC_DIRECT", "1") == "1"
-PROC_SLOW_SEC = float(os.getenv("PROC_SLOW_SEC", "10"))
+PROC_SLOW_SEC = float(os.getenv("PROC_SLOW_SEC", "30"))
 _proc_pid_cache: Dict[str, int] = {}
 _ovs_cache: Dict[str, Dict[str, Any]] = {}
 _last_slow_ts = 0.0
@@ -1292,7 +1302,18 @@ async def _collect_real(topology: Topology | None, labels: Dict[str, Any] | None
                     use_proc, local_seg = False, {}
             probe_script, sections = _build_probe_script(node, include_fast and not use_proc, include_slow and (_ping_due or not use_proc), _ping_target)
             if use_proc and node.type == "switch":
-                extra_script, extra_kind = (_OVS_SLOW_SCRIPT if include_slow else ""), "switch"
+                _c = _ovs_cache.get(container)
+                if include_slow and _c and _c.get("bridge") and _c.get("ports") and _c.get("n", 0) % 10 != 0:
+                    # v5: com ponte/portas em cache, so um processo (dump-flows); descoberta completa a cada 10 execucoes
+                    _c["n"] = _c.get("n", 0) + 1
+                    _br = _c["bridge"]
+                    _ports = " ".join(_c["ports"])
+                    extra_script = f"echo 'BRIDGE:{_br}'; echo '{_SCRIPT_SEP}'; echo '{_ports}'; echo '{_SCRIPT_SEP}'; ovs-ofctl dump-flows '{_br}' 2>/dev/null"
+                else:
+                    if include_slow and _c is not None:
+                        _c["n"] = _c.get("n", 0) + 1
+                    extra_script = _OVS_SLOW_SCRIPT if include_slow else ""
+                extra_kind = "switch"
             else:
                 extra_script, extra_kind = _build_extra_script(node, include_slow)
             if MERGE_EXEC and probe_script and extra_script:
@@ -1376,6 +1397,8 @@ async def _collect_real(topology: Topology | None, labels: Dict[str, Any] | None
                 if "snmp" in seg_map and seg_map["snmp"]:
                     snmp_data = _parse_snmp(seg_map["snmp"])
                     for key, val in snmp_data.items():
+                        if SNMP_ALLOW and key not in SNMP_ALLOW:
+                            continue
                         node_samples.append(_mk(f"snmp_{key}", "transport", node.id, float(val), {"source": "/proc/net/snmp"}))
 
                 # ── Link/Physical: ip -s link ─────────────────────────────────
@@ -2060,6 +2083,8 @@ if not metric_samples:
 _slow_task: Any = None
 # v4: a camada lenta (ping, fluxos OVS) roda em segundo plano e publica quando termina, sem atrasar a rapida.
 DECOUPLE_SLOW = os.getenv("DECOUPLE_SLOW", "1") == "1"
+# v5: desacoplar so quando o periodo e curto (<= DECOUPLE_MAX_INTERVAL s); acima disso o ciclo unico e mais rapido na visibilidade.
+DECOUPLE_MAX_INTERVAL = float(os.getenv("DECOUPLE_MAX_INTERVAL", "2"))
 
 
 async def _slow_cycle(topology: Any, labels: Dict[str, Any]) -> None:
@@ -2081,7 +2106,7 @@ async def _auto_collect_loop() -> None:
             if topology:
                 labels = {"version": software_version}
                 use_real_setting = system_settings.get("use_real_data", real_collection_default)
-                if use_real_setting and PROC_DIRECT and DECOUPLE_SLOW:
+                if use_real_setting and PROC_DIRECT and DECOUPLE_SLOW and collection_interval_seconds <= DECOUPLE_MAX_INTERVAL:
                     samples = await _collect_real(topology, labels, phase="fast")
                     if samples:
                         await asyncio.to_thread(_store_samples, samples, True)
@@ -2089,6 +2114,14 @@ async def _auto_collect_loop() -> None:
                     if (time.time() - _last_slow_ts) >= PROC_SLOW_SEC * 0.9 and (_slow_task is None or _slow_task.done()):
                         _last_slow_ts = time.time()
                         _slow_task = asyncio.create_task(_slow_cycle(topology, labels))
+                elif use_real_setting and PROC_DIRECT and DECOUPLE_SLOW:
+                    # v5: periodo longo: fase rapida publicada ja, fase lenta em seguida no mesmo ciclo (sem tarefa paralela)
+                    samples = await _collect_real(topology, labels, phase="fast")
+                    if samples:
+                        await asyncio.to_thread(_store_samples, samples, True)
+                    if (time.time() - _last_slow_ts) >= PROC_SLOW_SEC * 0.9:
+                        _last_slow_ts = time.time()
+                        await _slow_cycle(topology, labels)
                 else:
                     samples = await _collect_real(topology, labels) if use_real_setting else _collect_synthetic_full(topology, labels)
                     if samples:
