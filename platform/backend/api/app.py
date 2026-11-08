@@ -1040,6 +1040,146 @@ def _http_probe_controller(host: str, ports: tuple = (8080, 8181), timeout: floa
     return False, None
 
 
+# ── v3: leitura direta de /proc/<pid>/net e sysfs dos containers (sem `exec` por ciclo) ──────────
+# Requer o backend com `--pid host` e privilegio para ler /proc/<pid>/root. Se algo falhar,
+# o no volta ao caminho por `exec` (v2). PROC_DIRECT=0 restaura a v2.
+# Os contadores rapidos (interfaces, sockets, SNMP, portas OVS) vem de /proc; ping e fluxos OVS
+# (que dependem de processos dentro do container) rodam por `exec` a cada PROC_SLOW_SEC segundos
+# (tempo de parede, nao numero de ciclos).
+PROC_DIRECT = os.getenv("PROC_DIRECT", "1") == "1"
+PROC_SLOW_SEC = float(os.getenv("PROC_SLOW_SEC", "10"))
+_proc_pid_cache: Dict[str, int] = {}
+_ovs_cache: Dict[str, Dict[str, Any]] = {}
+_last_slow_ts = 0.0
+_OVS_SLOW_SCRIPT = (
+    "br=$(ovs-vsctl list-br 2>/dev/null | head -1); echo \"BRIDGE:$br\"; "
+    f"echo '{_SCRIPT_SEP}'; ovs-vsctl list-ports \"$br\" 2>/dev/null; "
+    f"echo '{_SCRIPT_SEP}'; ovs-ofctl dump-flows \"$br\" 2>/dev/null"
+)
+
+
+def _container_pid(container: str) -> int | None:
+    pid = _proc_pid_cache.get(container)
+    if pid and os.path.exists(f"/proc/{pid}/net/dev"):
+        return pid
+    st, data = _engine_request("GET", f"/containers/{container}/json")
+    if st != 200:
+        return None
+    pid = int(json.loads(data)["State"]["Pid"])
+    if pid <= 0:
+        return None
+    _proc_pid_cache[container] = pid
+    return pid
+
+
+def _proc_read(pid: int, rel: str) -> str:
+    with open(f"/proc/{pid}/{rel}") as fh:
+        return fh.read()
+
+
+def _proc_netdev(pid: int) -> List[tuple]:
+    rows = []
+    for ln in _proc_read(pid, "net/dev").splitlines()[2:]:
+        name, _, rest = ln.partition(":")
+        f = rest.split()
+        if len(f) >= 12:
+            rows.append((name.strip(), int(f[0]), int(f[1]), int(f[2]), int(f[3]), int(f[8]), int(f[9]), int(f[10]), int(f[11])))
+    return rows
+
+
+def _proc_operstate(pid: int, iface: str) -> str:
+    try:
+        return _proc_read(pid, f"root/sys/class/net/{iface}/operstate").strip().upper()
+    except OSError:
+        return "UP"   # sem sysfs legivel: mesmo padrao do parser da v1/v2 (interface ausente = ativa)
+
+
+def _proc_iplink_text(pid: int) -> str:
+    out: List[str] = []
+    for i, (name, rb, rp, re_, rd, tb, tp, te, td) in enumerate(_proc_netdev(pid), 1):
+        st = "UNKNOWN" if name == "lo" else _proc_operstate(pid, name)
+        out.append(f"{i}: {name}: <> mtu 1500 qdisc noqueue state {st} mode DEFAULT")
+        out.append("    RX: bytes packets errors dropped missed mcast")
+        out.append(f"    {rb} {rp} {re_} {rd} 0 0")
+        out.append("    TX: bytes packets errors dropped carrier collsns")
+        out.append(f"    {tb} {tp} {te} {td} 0 0")
+    return "\n".join(out)
+
+
+def _proc_sockstat(pid: int, rel: str) -> Dict[str, Dict[str, str]]:
+    d: Dict[str, Dict[str, str]] = {}
+    try:
+        for ln in _proc_read(pid, rel).splitlines():
+            name, _, rest = ln.partition(":")
+            t = rest.split()
+            d[name.strip()] = dict(zip(t[0::2], t[1::2]))
+    except OSError:
+        pass
+    return d
+
+
+def _proc_tcp_state_count(pid: int, state: str) -> int:
+    n = 0
+    for rel in ("net/tcp", "net/tcp6"):
+        try:
+            for ln in _proc_read(pid, rel).splitlines()[1:]:
+                f = ln.split()
+                if len(f) > 3 and f[3] == state:
+                    n += 1
+        except OSError:
+            pass
+    return n
+
+
+def _proc_ss_text(pid: int) -> str:
+    s4 = _proc_sockstat(pid, "net/sockstat")
+    s6 = _proc_sockstat(pid, "net/sockstat6")
+    g = lambda d, k, f: int(d.get(k, {}).get(f, 0))  # noqa: E731
+    total = g(s4, "sockets", "used")
+    tw, orph = g(s4, "TCP", "tw"), g(s4, "TCP", "orphan")
+    tcp4, tcp6 = g(s4, "TCP", "inuse"), g(s6, "TCP6", "inuse")
+    udp4, udp6 = g(s4, "UDP", "inuse"), g(s6, "UDP6", "inuse")
+    raw4, raw6 = g(s4, "RAW", "inuse"), g(s6, "RAW6", "inuse")
+    frag4, frag6 = g(s4, "FRAG", "inuse"), g(s6, "FRAG6", "inuse")
+    estab = _proc_tcp_state_count(pid, "01")
+    closed = _proc_tcp_state_count(pid, "07")
+    return "\n".join([
+        f"Total: {total}",
+        f"TCP:   {tcp4 + tcp6 + tw} (estab {estab}, closed {closed}, orphaned {orph}, timewait {tw})",
+        "Transport Total     IP        IPv6",
+        f"RAW\t  {raw4 + raw6}         {raw4}         {raw6}",
+        f"UDP\t  {udp4 + udp6}         {udp4}         {udp6}",
+        f"TCP\t  {tcp4 + tcp6}         {tcp4}         {tcp6}",
+        f"INET\t  {raw4 + raw6 + udp4 + udp6 + tcp4 + tcp6}         {raw4 + udp4 + tcp4}         {raw6 + udp6 + tcp6}",
+        f"FRAG\t  {frag4 + frag6}         {frag4}         {frag6}",
+    ])
+
+
+def _proc_ports_text(pid: int, ports: List[str], bridge: str) -> str:
+    nd = {r[0]: r for r in _proc_netdev(pid)}
+    lines: List[str] = []
+    for i, p in enumerate(ports, 1):
+        r = nd.get(p)
+        if r:
+            lines.append(f"  port  {i}: rx pkts={r[2]}, bytes={r[1]}, drop={r[4]}, errs={r[3]}, frame=0, over=0, crc=0")
+            lines.append(f"           tx pkts={r[6]}, bytes={r[5]}, drop={r[8]}, errs={r[7]}, coll=0")
+    r = nd.get(bridge)
+    if r:   # porta LOCAL do OVS: estatisticas do netdev interno com rx/tx invertidos
+        lines.append(f"  port LOCAL: rx pkts={r[6]}, bytes={r[5]}, drop={r[8]}, errs={r[7]}, frame=0, over=0, crc=0")
+        lines.append(f"           tx pkts={r[2]}, bytes={r[1]}, drop={r[4]}, errs={r[3]}, coll=0")
+    return "\n".join(lines)
+
+
+def _proc_fast_segments(pid: int) -> Dict[str, str]:
+    seg: Dict[str, str] = {}
+    if layer_flags.get("transport", True):
+        seg["ss"] = _proc_ss_text(pid)
+        seg["snmp"] = _proc_read(pid, "net/snmp")
+    if layer_flags.get("link", True) or layer_flags.get("physical", True):
+        seg["iplink"] = _proc_iplink_text(pid)
+    return seg
+
+
 async def _collect_real(topology: Topology | None, labels: Dict[str, Any] | None = None) -> List[MetricSample]:
     global _collect_cycle_count
     if not topology:
@@ -1054,6 +1194,13 @@ async def _collect_real(topology: Topology | None, labels: Dict[str, Any] | None
     # correctly fires on cycle 1, N+1, 2N+1, ... for every N >= 1.
     include_fast = (_collect_cycle_count - 1) % FAST_PROBE_INTERVAL_CYCLES == 0
     include_slow = (_collect_cycle_count - 1) % SLOW_PROBE_INTERVAL_CYCLES == 0
+    if PROC_DIRECT:
+        global _last_slow_ts
+        include_fast = True
+        # 0.9: tolera o jitter do ciclo para que, a 10 s, a camada lenta nao pule um ciclo
+        include_slow = (now_ts - _last_slow_ts) >= PROC_SLOW_SEC * 0.9
+        if include_slow:
+            _last_slow_ts = now_ts
     global _last_stats_probe_ts
     include_stats = (now_ts - _last_stats_probe_ts) >= STATS_PROBE_INTERVAL_SEC
     if include_stats:
@@ -1107,8 +1254,21 @@ async def _collect_real(topology: Topology | None, labels: Dict[str, Any] | None
                 _peers = [n for n in topology.nodes if n.type == "host" and n.id != node.id and (n.meta.get("data_ip") or n.mgmt_ip)]
                 if _peers:
                     _ping_target = _peers[0].meta.get("data_ip") or _peers[0].mgmt_ip
-            probe_script, sections = _build_probe_script(node, include_fast, include_slow, _ping_target)
-            extra_script, extra_kind = _build_extra_script(node, include_slow)
+            use_proc, proc_pid, local_seg = False, None, {}
+            if PROC_DIRECT and node.type in ("host", "switch"):
+                try:
+                    proc_pid = _container_pid(container)
+                    if proc_pid:
+                        local_seg = _proc_fast_segments(proc_pid)
+                        use_proc = True
+                except Exception as exc:
+                    logger.warning(f"PROC_DIRECT indisponivel para {container} ({exc}); usando exec")
+                    use_proc, local_seg = False, {}
+            probe_script, sections = _build_probe_script(node, include_fast and not use_proc, include_slow, _ping_target)
+            if use_proc and node.type == "switch":
+                extra_script, extra_kind = (_OVS_SLOW_SCRIPT if include_slow else ""), "switch"
+            else:
+                extra_script, extra_kind = _build_extra_script(node, include_slow)
             if MERGE_EXEC and probe_script and extra_script:
                 _merged = await _run_docker_script(container, f"{probe_script} ; echo '{_PART_SEP}' ; {extra_script}")
                 probe_out, _, extra_out = _merged.partition(_PART_SEP)
@@ -1135,10 +1295,22 @@ async def _collect_real(topology: Topology | None, labels: Dict[str, Any] | None
                 if ctrl_latency_ms is not None:
                     node_samples.append(_mk("controller_latency_ms", "control", node.id, ctrl_latency_ms, {"source": "curl"}))
 
-            if probe_out and sections:
-                seg = probe_out.split(_SCRIPT_SEP)
+            if use_proc and node.type == "switch":
+                cache = _ovs_cache.setdefault(container, {"bridge": "", "ports": []})
+                flows_fresh = ""
+                if extra_out.strip():
+                    parts = extra_out.split(_SCRIPT_SEP)
+                    cache["bridge"] = parts[0].split("BRIDGE:")[-1].strip()
+                    cache["ports"] = parts[1].split() if len(parts) > 1 else []
+                    flows_fresh = parts[2].strip() if len(parts) > 2 else ""
+                ports_text = _proc_ports_text(proc_pid, cache["ports"], cache["bridge"]) if cache["ports"] else ""
+                extra_out = f"BRIDGE:{cache['bridge']}{_SCRIPT_SEP}{ports_text}{_SCRIPT_SEP}{flows_fresh}"
+
+            if (probe_out and sections) or local_seg:
+                seg = probe_out.split(_SCRIPT_SEP) if (probe_out and sections) else []
                 seg += [""] * (len(sections) - len(seg))
                 seg_map = dict(zip(sections, (s.strip("\n") for s in seg)))
+                seg_map.update(local_seg)
 
                 # ── Transport: ss -s and /proc/net/snmp ──────────────────────
                 if "ss" in seg_map:
