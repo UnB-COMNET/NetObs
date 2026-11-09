@@ -46,7 +46,8 @@ from platform.backend.schemas import (
     TopologyUpdate,
 )
 
-from platform.backend.core.metric_catalog import metric_definitions as catalog_metric_definitions
+from platform.backend.core.metric_catalog import metric_definitions as catalog_metric_definitions, collector_metric_definitions
+from platform.backend.core.semantics import SemanticLayer, Rule as SemRule, MixedClassError
 from platform.backend.core.netmon_blocks import list_grc_blocks
 from platform.backend.core.netmon_bridge import netmon_metric_definitions, run_host_ping, samples_from_netmon
 
@@ -813,7 +814,7 @@ def _parse_docker_stats_batch(containers: List[str]) -> Dict[str, Dict[str, floa
 def _parse_ss_summary(output: str) -> Dict[str, float]:
     summary: Dict[str, float] = {
         "total": 0,
-        "tcp_total": 0,
+        "tcp_hdr_total": 0,
         "tcp_estab": 0,
         "tcp_closed": 0,
         "tcp_orphaned": 0,
@@ -830,7 +831,7 @@ def _parse_ss_summary(output: str) -> Dict[str, float]:
             if m:
                 summary.update(
                     {
-                        "tcp_total": float(m.group(1)),
+                        "tcp_hdr_total": float(m.group(1)),
                         "tcp_estab": float(m.group(2)),
                         "tcp_closed": float(m.group(3)),
                         "tcp_orphaned": float(m.group(4)),
@@ -927,10 +928,16 @@ def _parse_ip_link(output: str) -> Dict[str, Dict[str, float]]:
                 metrics[current].setdefault("dropped", float(parts[idx_d - 1]))
             except (ValueError, IndexError):
                 pass
-    # Backward-compatible aliases
+    # v6: erros e descartes somam RX e TX (antes o alias usava so TX)
     for iface, vals in metrics.items():
-        vals.setdefault("errors",  vals.get("tx_errors",  0.0))
-        vals.setdefault("dropped", vals.get("tx_dropped", 0.0))
+        if "rx_errors" in vals or "tx_errors" in vals:
+            vals["errors"] = vals.get("rx_errors", 0.0) + vals.get("tx_errors", 0.0)
+        else:
+            vals.setdefault("errors", 0.0)
+        if "rx_dropped" in vals or "tx_dropped" in vals:
+            vals["dropped"] = vals.get("rx_dropped", 0.0) + vals.get("tx_dropped", 0.0)
+        else:
+            vals.setdefault("dropped", 0.0)
     return metrics
 
 
@@ -1077,7 +1084,8 @@ PING_EVERY_SEC = float(os.getenv("PING_EVERY_SEC", "30"))
 _OVS_SLOW_SCRIPT = (
     "br=$(ovs-vsctl list-br 2>/dev/null | head -1); echo \"BRIDGE:$br\"; "
     f"echo '{_SCRIPT_SEP}'; ovs-vsctl list-ports \"$br\" 2>/dev/null; "
-    f"echo '{_SCRIPT_SEP}'; ovs-ofctl dump-flows \"$br\" 2>/dev/null"
+    f"echo '{_SCRIPT_SEP}'; ovs-ofctl dump-flows \"$br\" 2>/dev/null; "
+    f"echo '{_SCRIPT_SEP}'; ovs-vsctl --bare --columns=is_connected list controller 2>/dev/null"
 )
 
 
@@ -1165,10 +1173,13 @@ def _proc_ss_text(pid: int) -> str:
     raw4, raw6 = g(s4, "RAW", "inuse"), g(s6, "RAW6", "inuse")
     frag4, frag6 = g(s4, "FRAG", "inuse"), g(s6, "FRAG6", "inuse")
     estab = _proc_tcp_state_count(pid, "01")
-    closed = _proc_tcp_state_count(pid, "07")
+    # v6: mesma conta do iproute2 (ss -s): total = alloc + tw; closed = total - estab (antes: so sockets em uso)
+    alloc = g(s4, "TCP", "alloc") + g(s6, "TCP6", "alloc")
+    tcp_total_ss = alloc + tw if alloc else tcp4 + tcp6 + tw
+    closed = max(tcp_total_ss - estab, 0)
     return "\n".join([
         f"Total: {total}",
-        f"TCP:   {tcp4 + tcp6 + tw} (estab {estab}, closed {closed}, orphaned {orph}, timewait {tw})",
+        f"TCP:   {tcp_total_ss} (estab {estab}, closed {closed}, orphaned {orph}, timewait {tw})",
         "Transport Total     IP        IPv6",
         f"RAW\t  {raw4 + raw6}         {raw4}         {raw6}",
         f"UDP\t  {udp4 + udp6}         {udp4}         {udp6}",
@@ -1308,7 +1319,7 @@ async def _collect_real(topology: Topology | None, labels: Dict[str, Any] | None
                     _c["n"] = _c.get("n", 0) + 1
                     _br = _c["bridge"]
                     _ports = " ".join(_c["ports"])
-                    extra_script = f"echo 'BRIDGE:{_br}'; echo '{_SCRIPT_SEP}'; echo '{_ports}'; echo '{_SCRIPT_SEP}'; ovs-ofctl dump-flows '{_br}' 2>/dev/null"
+                    extra_script = f"echo 'BRIDGE:{_br}'; echo '{_SCRIPT_SEP}'; echo '{_ports}'; echo '{_SCRIPT_SEP}'; ovs-ofctl dump-flows '{_br}' 2>/dev/null; echo '{_SCRIPT_SEP}'; ovs-vsctl --bare --columns=is_connected list controller 2>/dev/null"
                 else:
                     if include_slow and _c is not None:
                         _c["n"] = _c.get("n", 0) + 1
@@ -1344,14 +1355,15 @@ async def _collect_real(topology: Topology | None, labels: Dict[str, Any] | None
 
             if use_proc and node.type == "switch":
                 cache = _ovs_cache.setdefault(container, {"bridge": "", "ports": []})
-                flows_fresh = ""
+                flows_fresh, ctrl_fresh = "", ""
                 if extra_out.strip():
                     parts = extra_out.split(_SCRIPT_SEP)
                     cache["bridge"] = parts[0].split("BRIDGE:")[-1].strip()
                     cache["ports"] = parts[1].split() if len(parts) > 1 else []
                     flows_fresh = parts[2].strip() if len(parts) > 2 else ""
+                    ctrl_fresh = parts[3].strip() if len(parts) > 3 else ""
                 ports_text = _proc_ports_text(proc_pid, cache["ports"], cache["bridge"]) if (cache["ports"] and phase != "slow") else ""
-                extra_out = f"BRIDGE:{cache['bridge']}{_SCRIPT_SEP}{ports_text}{_SCRIPT_SEP}{flows_fresh}"
+                extra_out = f"BRIDGE:{cache['bridge']}{_SCRIPT_SEP}{ports_text}{_SCRIPT_SEP}{flows_fresh}{_SCRIPT_SEP}{ctrl_fresh}"
 
             if (probe_out and sections) or local_seg:
                 seg = probe_out.split(_SCRIPT_SEP) if (probe_out and sections) else []
@@ -1369,7 +1381,7 @@ async def _collect_real(topology: Topology | None, labels: Dict[str, Any] | None
                                 "ss_tcp_states",
                                 "transport",
                                 node.id,
-                                ss_data.get("tcp_total", 0.0),
+                                ss_data.get("tcp_hdr_total", 0.0),
                                 {
                                     "estab": ss_data.get("tcp_estab", 0.0),
                                     "closed": ss_data.get("tcp_closed", 0.0),
@@ -1418,9 +1430,9 @@ async def _collect_real(topology: Topology | None, labels: Dict[str, Any] | None
                             node_samples.append(_mk("if_discards", "physical", path, vals.get("dropped", 0.0), {"source": "ip -s link"}))
 
                         if layer_flags.get("link", True):
-                            node_samples.append(_mk("queue_drops", "link", path, vals.get("dropped", 0.0), {"source": "ip -s link"}))
+                            # v6: queue_drops removido (duplicava if_discards com nome de fila que nao e medida)
                             up_val = float(iface_up.get(iface, True))
-                            node_samples.append(_mk("if_link_up", "link", path, up_val, {"source": "ip link show"}))
+                            node_samples.append(_mk("if_link_up", "physical", path, up_val, {"source": "ip link show"}))
 
                             # Delta-based utilization: compare with previous reading
                             prev_key = f"{node.id}:{iface}"
@@ -1468,9 +1480,12 @@ async def _collect_real(topology: Topology | None, labels: Dict[str, Any] | None
                 bridge = bridge_line.split("BRIDGE:")[-1].strip() or f"br-{node.id}"
                 ofctl_ports = raw_parts[1].strip() if len(raw_parts) > 1 else ""
                 flows_dump = raw_parts[2].strip() if len(raw_parts) > 2 else ""
+                ctrl_state = raw_parts[3].strip() if len(raw_parts) > 3 else ""
 
+                # v6: estado real da sessao OpenFlow com o controlador (is_connected), medido pelo proprio switch
+                if layer_flags.get("control", True) and ctrl_state:
+                    node_samples.append(_mk("switch_controller_session_up", "control", node.id, 1.0 if "true" in ctrl_state.lower() else 0.0, {"source": "ovs-vsctl is_connected", "bridge": bridge}))
                 if layer_flags.get("control", True) and ofctl_ports:
-                    node_samples.append(_mk("controller_conn_ok", "control", node.id, 1.0, {"source": "ovs-ofctl", "bridge": bridge}))
                     # Parse per-port rx/tx from dump-ports
                     port_rx = re.findall(r"rx pkts=(\d+)", ofctl_ports)
                     port_tx = re.findall(r"tx pkts=(\d+)", ofctl_ports)
@@ -1482,10 +1497,7 @@ async def _collect_real(topology: Topology | None, labels: Dict[str, Any] | None
                     port_drop = re.findall(r"tx drop=(\d+)", ofctl_ports)
                     total_drop = sum(int(x) for x in port_drop)
                     node_samples.append(_mk("port_tx_drops", "dataplane", node.id, float(total_drop), {"source": "ovs-ofctl", "bridge": bridge}))
-                    # Queue occupancy proxy: drop% as occupancy
-                    if total_tx > 0:
-                        occ = round(total_drop / total_tx * 100.0, 3)
-                        node_samples.append(_mk("queue_occupancy_pct", "link", node.id, occ, {"source": "ovs-ofctl"}))
+                    # v6: a ocupacao de fila nao e medida por dump-ports (a razao de descartes era um proxy); nao e emitida
 
                 if layer_flags.get("dataplane", True) and flows_dump:
                     flow_lines = [ln for ln in flows_dump.splitlines() if "n_packets" in ln]
@@ -1499,7 +1511,6 @@ async def _collect_real(topology: Topology | None, labels: Dict[str, Any] | None
                     total_pkts  = sum(float(re.search(r"n_packets=(\d+)", ln).group(1)) for ln in flow_lines if re.search(r"n_packets=(\d+)", ln))
                     node_samples.append(_mk("flows_installed", "control",   node.id, float(len(flow_lines)),  {"source": "ovs-ofctl"}))
                     node_samples.append(_mk("table_hits",      "dataplane", node.id, round(total_pkts, 0),   {"source": "ovs-ofctl"}))
-                    node_samples.append(_mk("table_misses",    "dataplane", node.id, 0.0,                    {"source": "ovs-ofctl"}))
 
         except Exception as e:
             logger.error(f"Erro ao coletar métricas do nó {node.id}: {e}")
@@ -1518,14 +1529,14 @@ async def _collect_real(topology: Topology | None, labels: Dict[str, Any] | None
             if s.metric == "link_util_pct" and s.node.startswith(f"{link.source}:")
         ]
         if src_utils:
-            samples.append(_mk("link_util_pct", "link", link_path, round(max(src_utils), 3), {"source": "aggregated"}))
+            samples.append(_mk("link_path_util_pct", "link", link_path, round(max(src_utils), 3), {"source": "aggregated"}))
         # if_link_up: mark link down if any iface on source or target is down
         src_up = [
             s.value for s in samples
             if s.metric == "if_link_up" and (s.node.startswith(f"{link.source}:") or s.node.startswith(f"{link.target}:"))
         ]
         if src_up:
-            samples.append(_mk("if_link_up", "link", link_path, float(all(v >= 0.5 for v in src_up)), {"source": "aggregated"}))
+            samples.append(_mk("link_path_up", "link", link_path, float(all(v >= 0.5 for v in src_up)), {"source": "aggregated"}))
 
     return samples
 
@@ -1998,7 +2009,7 @@ system_settings: Dict[str, Any] = {
 
 
 def _extended_metric_definitions() -> List[MetricDefinition]:
-    return catalog_metric_definitions() + netmon_metric_definitions()
+    return catalog_metric_definitions() + netmon_metric_definitions() + collector_metric_definitions()
 
 
 # Defaults; may be overridden/augmented by platform_config.json.
@@ -2817,15 +2828,42 @@ async def execute_netmon_ping(
     return payload
 
 
+# v6: camada de normalizacao semantica (SEMANTIC_MODE=on valida, converte e desduplica; off = aceita tudo).
+semantic_layer = SemanticLayer(_extended_metric_definitions(), enabled=os.getenv("SEMANTIC_MODE", "off") == "on")
+
+
+@app.post("/semantic/runs", response_model=Dict[str, str])
+async def semantic_register_run(run_id: str, experiment_id: str, topology_id: str = "") -> Dict[str, str]:
+    semantic_layer.register_run(run_id, experiment_id, topology_id)
+    return {"run_id": run_id}
+
+
+@app.post("/semantic/source/{source}", response_model=Dict[str, str])
+async def semantic_register_source(source: str, rules: Dict[str, Dict[str, Any]]) -> Dict[str, str]:
+    semantic_layer.register_source(source, {k: SemRule(**v) for k, v in rules.items()})
+    return {"source": source}
+
+
+@app.get("/semantic/classes", response_model=Dict[str, Any])
+async def semantic_classes() -> Dict[str, Any]:
+    cls = semantic_layer.classes()
+    return {"enabled": semantic_layer.enabled, "metrics": len(semantic_layer.defs), "classes": len(cls),
+            "multi_member": {m.label(): v for m, v in cls.items() if len(v) > 1}}
+
+
 @app.post("/metrics/samples", response_model=Dict[str, int], status_code=status.HTTP_201_CREATED)
-async def ingest_samples(payload: MetricSample | List[MetricSample]) -> Dict[str, int]:
+async def ingest_samples(payload: MetricSample | List[MetricSample], source: str = "api") -> Dict[str, int]:
     samples: List[MetricSample]
     if isinstance(payload, list):
         samples = payload
     else:
         samples = [payload]
-    _store_samples(samples)
-    return {"stored": len(samples)}
+    res = semantic_layer.ingest(samples, source=source)
+    if res.accepted:
+        _store_samples(res.accepted)
+    out = res.counts()
+    out["stored"] = len(res.accepted)
+    return out
 
 
 @app.get("/metrics/latest", response_model=List[MetricSample])

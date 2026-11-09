@@ -498,10 +498,10 @@ METRIC_CATALOG: List[MetricDefinition] = [
     md("db_query_latency_ms_p95", "Database query latency p95 (alto nível)", unit="ms", layer="application", kind="summary", osi_layer=7, category="db", dimensions=["db", "service"]),
 
     # Control-plane (platform)
-    md("controller_latency_ms", "Controller latency", unit="ms", layer="control", kind="gauge", category="control", dimensions=["controller", "endpoint"]),
+    md("controller_latency_ms", "Latencia da API REST do controlador (sonda HTTP do coletor)", unit="ms", layer="control", kind="gauge", category="control", dimensions=["controller"]),
     md("controller_conn_ok", "Controller connectivity", unit="bool", layer="control", kind="gauge", category="control", dimensions=["controller"]),
     md("of_channel_reconnects", "OpenFlow reconnects", unit="count", layer="control", kind="counter", category="control", dimensions=["switch"]),
-    md("flows_installed", "Flows installed", unit="count", layer="control", kind="counter", category="control", dimensions=["controller", "switch"]),
+    md("flows_installed", "Numero de fluxos instalados no switch (dump-flows)", unit="count", layer="control", kind="gauge", category="control", dimensions=["switch"]),
     md("flows_removed", "Flows removed", unit="count", layer="control", kind="counter", category="control", dimensions=["controller", "switch"]),
     md("cpu_util_pct", "CPU utilization", unit="%", layer="control", kind="gauge", category="host", dimensions=["node"]),
     md("mem_util_pct", "Memory utilization", unit="%", layer="control", kind="gauge", category="host", dimensions=["node"]),
@@ -509,14 +509,14 @@ METRIC_CATALOG: List[MetricDefinition] = [
     md("docker_mem_util_pct", "Memory utilization (Docker container)", unit="%", layer="control", kind="gauge", category="host", dimensions=["node"]),
 
     # Dataplane (platform)
-    md("openflow_flow_packets", "Flow packets", unit="packets", layer="dataplane", kind="counter", category="dataplane", dimensions=["switch", "table", "flow"]),
-    md("openflow_flow_bytes", "Flow bytes", unit="bytes", layer="dataplane", kind="counter", category="dataplane", dimensions=["switch", "table", "flow"]),
-    md("table_hits", "Table hits", unit="count", layer="dataplane", kind="counter", category="dataplane", dimensions=["switch", "table"]),
+    md("openflow_flow_packets", "Pacotes por fluxo (n_packets)", unit="packets", layer="dataplane", kind="counter", category="dataplane", dimensions=["switch", "flow"]),
+    md("openflow_flow_bytes", "Bytes por fluxo (n_bytes)", unit="bytes", layer="dataplane", kind="counter", category="dataplane", dimensions=["switch", "flow"]),
+    md("table_hits", "Soma de n_packets de todos os fluxos do switch", unit="count", layer="dataplane", kind="counter", category="dataplane", dimensions=["switch"]),
     md("table_misses", "Table misses", unit="count", layer="dataplane", kind="counter", category="dataplane", dimensions=["switch", "table"]),
-    md("port_rx_pkts", "Port RX packets", unit="packets", layer="dataplane", kind="counter", category="dataplane", dimensions=["switch", "port"]),
-    md("port_tx_pkts", "Port TX packets", unit="packets", layer="dataplane", kind="counter", category="dataplane", dimensions=["switch", "port"]),
+    md("port_rx_pkts", "Pacotes recebidos, soma de todas as portas do switch", unit="packets", layer="dataplane", kind="counter", category="dataplane", dimensions=["switch"]),
+    md("port_tx_pkts", "Pacotes transmitidos, soma de todas as portas do switch", unit="packets", layer="dataplane", kind="counter", category="dataplane", dimensions=["switch"]),
     md("port_rx_drops", "Port RX drops", unit="packets", layer="dataplane", kind="counter", category="dataplane", dimensions=["switch", "port"]),
-    md("port_tx_drops", "Port TX drops", unit="packets", layer="dataplane", kind="counter", category="dataplane", dimensions=["switch", "port"]),
+    md("port_tx_drops", "Descartes na transmissao, soma de todas as portas do switch", unit="packets", layer="dataplane", kind="counter", category="dataplane", dimensions=["switch"]),
     md("flow_bytes", "Flow byte counter", unit="bytes", layer="dataplane", kind="counter", category="dataplane", dimensions=["src", "dst", "5tuple"]),
     md("flow_packets", "Flow packet counter", unit="packets", layer="dataplane", kind="counter", category="dataplane", dimensions=["src", "dst", "5tuple"]),
     md("flow_duration_sec", "Flow duration", unit="s", layer="dataplane", kind="gauge", category="dataplane", dimensions=["src", "dst", "5tuple"]),
@@ -555,3 +555,21 @@ METRIC_CATALOG: List[MetricDefinition] = [
 def metric_definitions() -> List[MetricDefinition]:
     # Return a copy to keep callers from mutating the canonical catalog.
     return list(METRIC_CATALOG)
+
+
+def collector_metric_definitions() -> List[MetricDefinition]:
+    """Metricas que o coletor real emite e que nao existiam no catalogo (v6): o contrato passa a cobrir o que e medido."""
+    defs = [
+        md("switch_controller_session_up", "Sessao OpenFlow do switch com o controlador (ovs-vsctl is_connected)", unit="bool", layer="control", kind="gauge", category="control", dimensions=["switch"]),
+        md("if_in_util_pct", "Utilizacao de entrada da interface (delta de bytes RX / capacidade assumida de 1 Gbps)", unit="%", layer="link", kind="gauge", osi_layer=2, category="capacity", dimensions=["node", "interface"]),
+        md("if_out_util_pct", "Utilizacao de saida da interface (delta de bytes TX / capacidade assumida de 1 Gbps)", unit="%", layer="link", kind="gauge", osi_layer=2, category="capacity", dimensions=["node", "interface"]),
+        md("link_path_util_pct", "Maior utilizacao entre as interfaces de um enlace origem->destino", unit="%", layer="link", kind="gauge", osi_layer=2, category="capacity", dimensions=["link"]),
+        md("link_path_up", "Enlace origem->destino ativo (todas as interfaces das duas pontas em UP)", unit="bool", layer="link", kind="gauge", osi_layer=2, category="capacity", dimensions=["link"]),
+    ]
+    gauges = {"tcp_currestab"}
+    for key in ("ip_inreceives ip_outrequests ip_indiscards ip_outdiscards ip_inhdrerrors icmp_inmsgs icmp_outmsgs icmp_inechos icmp_outechos "
+                "icmp_inechoreps icmp_outechoreps icmp_inerrors tcp_currestab tcp_insegs tcp_outsegs tcp_retranssegs tcp_inerrs tcp_outrsts "
+                "tcp_activeopens tcp_passiveopens udp_indatagrams udp_outdatagrams udp_inerrors udp_noports").split():
+        defs.append(md(f"snmp_{key}", f"/proc/net/snmp: {key}", unit="count", layer="transport", kind="gauge" if key in gauges else "counter",
+                       osi_layer=4, category="snmp", dimensions=["node"]))
+    return defs
